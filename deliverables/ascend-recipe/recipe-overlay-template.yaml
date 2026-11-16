@@ -1,0 +1,940 @@
+# yaml-language-server: $schema=https://recipes.vllm.ai/recipe.schema.json
+#
+# vLLM Ascend 共享模型 Overlay 全场景配置模板
+# ============================================
+#
+# 【一、文件用途与放置位置】
+# 本文件用于给 vLLM 已有的共享模型 base recipe 增加 Ascend/Huawei 能力。
+# 它不是一份可以独立存在的完整 recipe，而是一层“只增不改”的 overlay。
+#
+# 在 vllm-project/vllm-ascend 中的目标路径：
+#   recipes/overlays/__HF_ORG__/__HF_REPO__.yaml
+#
+# 【必填】路径中的 org/repo 必须与 Hugging Face  canonical 仓库名完全一致，
+# 包括大小写。对应的 base recipe 必须已经存在于：
+#   vllm-project/vllm: recipes/models/__HF_ORG__/__HF_REPO__.yaml
+#
+# base recipe 负责提供模型身份、参数量、架构、默认 variant、特性和基础策略；
+# 本 overlay 只能增加 Huawei 硬件状态、Ascend variant、preset、硬件级覆盖、
+# 依赖、notes 和 guide_sections。禁止把 base 的 model、compatible_strategies、
+# 顶层 guide 等字段复制到本文件中。
+#
+# 上方的 JSON Schema 校验的是 overlay 合并后的完整 recipe；assembler 另外识别
+# guide_sections 和 dependencies[].position 这两个 overlay 专用字段。
+# 权威字段说明：https://github.com/vllm-project/recipes/blob/main/SCHEMA.md
+# Ascend PD 实现依据：https://github.com/vllm-project/recipes/pull/1226
+#
+# 【二、本模板的标注约定】
+# - 【必填】：schema 或 overlay 规则要求，缺少时构建失败。
+# - 【条件必填】：只有启用对应场景时才需要；不使用该场景时删除整个配置块。
+# - 【模板约定必填】：schema 技术上允许省略，但为了证据可追溯或满足本任务
+#   的全场景交付要求，实际 PR 中必须填写。
+# - 【选配】：可按模型、checkpoint、硬件或 runtime 证据决定是否保留。
+# - 【默认值】：不写该字段时 renderer/base 的行为。这里的“默认”不代表已经
+#   通过目标模型的运行验证，只表示系统会采用的配置来源或回退逻辑。
+# - 【禁止】：当前 overlay 不允许或当前 renderer 无法正确表达，不能强行填写。
+#
+# 【三、使用顺序】
+# 1. 核实 base recipe、所有 HF checkpoint、runtime commit、镜像 tag/digest 和
+#    目标 Ascend 硬件。将所有 __UPPER_SNAKE_CASE__ 占位符替换为真实值。
+# 2. 删除目标模型不支持的选配块。不要为了“看起来全”而保留未验证的精度、
+#    策略、特性或硬件。删除 variant 后，同步修改 preset.variants。
+# 3. 先完成 meta、variants 和 strategy_hardware，再配置硬件/策略 override，
+#    最后填写有证据来源的 presets。PD 必须填写 ascend_pd preset。
+# 4. 运行严格校验，检查生成的 JSON/Markdown，而不是只检查 YAML 语法：
+#      node scripts/validate-source.mjs --source vllm-ascend --dir /path/to/vllm-ascend/recipes
+# 5. 按 pr-checklist.md 完成实机、分布式、性能、容错、文档和最终 CI 验证。
+#    未替换任何占位符的模板不得提交。
+#
+# 【四、硬件 id 与证据状态】
+# 当前 taxonomy 中常见的 Ascend id 包括：ascend_950pr、ascend_950dt、
+# ascend_910c、ascend_910b、ascend_950dt_8x、ascend_950pr_8x。
+# 必须以 CI 实际使用的 renderer taxonomy.yaml 为准；不得创造硬件 id，也不得
+# 把 "Ascend 950DT" 之类的显示名当作 key。
+#
+# 【五、Override 教程：先理解“合并”与“覆盖”的区别】
+# 1. Overlay 本身是 add-only：不能替换 base 已经拥有的普通字段。只有
+#    OVERLAY_RULES 明确开放的 Huawei 子键可以追加；与 base 完全相同的条目
+#    会被视为 no-op，而不是重复添加。
+# 2. 硬件 map 的常见优先级为：精确硬件 id > generation > 小写 brand > default。
+#    例如 ascend_950dt > npu > huawei > default。不同字段支持的 keyspace 并不
+#    完全相同：variant.hardware_overrides 还区分 generation 与精确硬件两类作用，
+#    strategy_min_gpus 只读取精确硬件 id 的条件 floor，不能一概而论。
+# 3. 参数层级的通常顺序为：base model/variant → recipe hardware_overrides →
+#    variant hardware_overrides → strategy hardware_overrides → preset →
+#    preset point → features/KV offload → preset remove_args/json_args 最终修正。
+#    具体字段仍以 SCHEMA.md 为准，不能利用顺序制造互相矛盾的 TP/PP/DP 拓扑。
+# 4. extra_args/extra_env 是“增加/追加”语义；feature 的 hardware_overrides
+#    使用 args/env；preset 的 roles 使用 args/env/remove_args/json_args。
+#    不要混用字段名。重复 flag 通常 last-wins，但布尔开关需要用 remove_args
+#    才能真正删除，不能指望再写一个相反参数解决所有问题。
+# 5. strategy_overrides.<strategy>.hardware_overrides 会对该硬件+策略的所有
+#    用户生效，适合放“每次选择该策略都必须有”的要求；某个 benchmark lane
+#    或一套调优拓扑必须放 preset，不能写成所有人的默认 override。
+# 6. Overlay 不能把 base 的 scalar 改成 map。例如 base 的 PD role tp 已是数字
+#    时，不能在 overlay 中直接改成 {ascend_950dt: 4}；应改用精确硬件 preset。
+# 7. 修改拓扑时优先使用 roles.nodes/parallelism/tp/pp 和 select.nodes，不要用
+#    raw args 再写一套 --tensor-parallel-size/--data-parallel-size，否则 worker
+#    命令、connector 元数据和 Router endpoints 可能互相矛盾。
+# 8. remove_args 删除 flag 及其值，flag 不存在时是 no-op；json_args 对 JSON
+#    对象做深合并，null 删除键。KV connector 使用名称寻址的 json_args，避免
+#    覆盖整个 MultiConnector。feature/KV toggle 拥有的 JSON flag 只在 toggle
+#    开启时编辑，防止关闭特性后残留半份配置。
+#
+# 【六、哪些配置块应视为“本次全场景模板的条件必填”】
+# - 所有模型：meta.hardware、至少一个可用 variant、single_node_tp。
+# - 需要多节点 TP：multi_node_tp。
+# - 需要 TP+PP：multi_node_tp_pp；当前没有 single_node_tp_pp。
+# - 需要 TP+DP：multi_node_tp_dp；当前没有 single_node_tp_dp。
+# - MoE 的 DP+EP：single_node_dep/multi_node_dep 按实测保留。
+# - 显式 DP+TP+EP 和 PD 分离：pd_cluster + ascend_pd preset；非 PD 的聚合
+#   DEP 不能被描述为可独立设置任意 TP 的完整 DP+TP+EP。
+
+meta:
+  # 【选配；默认继承 base.date_updated】overlay 只有在发生实质内容变化时才
+  # 更新此日期，格式 YYYY-MM-DD。合并时保留 base 与 overlay 中较晚的日期。
+  # date_added 不可在 overlay 中设置，它由 base 首次入目录的日期决定。
+  date_updated: __DATE_UPDATED__
+
+  # 【条件必填：所有 restricted Ascend profile】没有此声明时，restricted
+  # 硬件不会出现在选择器中。key 必须是 taxonomy 的精确硬件 id。
+  # value 只能是 supported | verified | unsupported：
+  # - supported：声明可选/具备支持路径，但不声称已做端到端验证。
+  # - verified：只有最终 PR head 对应的端到端证据齐全时才可使用。
+  # - unsupported：已确认当前存在 blocker；不能用来表示“尚未测试”。
+  # 【默认】普通硬件未列出时按 fail-open 处理且无验证徽标；restricted
+  # Ascend 硬件未列出时不会显示。该状态是 recipe 级别，不区分 variant。
+  hardware:
+    __ASCEND_HARDWARE_ID__: supported
+
+# 【选配；默认不增加任何依赖】仅当 base 安装步骤之外确有 Ascend 依赖或
+# 主机前置步骤时保留。没有额外步骤时删除整个 dependencies 块。
+dependencies:
+  # 【必填：保留本数组项时】note 说明“为什么需要”，command 必须是完整、
+  # 可执行的步骤；需要可复现时应固定版本或 commit。
+  # 【条件必填：overlay】brand 必须是 Huawei，或仅包含 scope 允许品牌的数组。
+  # 【选配；默认 [pip]】install_modes 决定在哪些安装标签页展示。
+  # 只有 Docker 无法替代的主机侧前置条件才使用 [pip, docker]，普通 pip 包
+  # 不要为了“可见性”重复放到 Docker 标签页。
+  # 【选配；默认 start】position 是 overlay 专用字段：start 排在 base deps
+  # 之前，end 排在之后。合并后该字段会被移除，不进入最终 recipe schema。
+  # 【选配；默认 false】optional: true 会淡化该步骤并从 Copy-all 排除，
+  # 只用于确实可选的步骤，不能用它掩盖缺失的运行依赖。
+  - note: "__ASCEND_DEPENDENCY_REASON__"
+    command: "__ASCEND_DEPENDENCY_COMMAND__"
+    brand: Huawei
+    install_modes: [pip]
+    position: start
+    # optional: true
+
+# 【选配；默认完全继承 base features】只能修改 base 已存在 feature 的 Huawei
+# 覆盖，不能在 overlay 中创造新的顶层 feature。此层使用 args/env，而不是
+# extra_args/extra_env。未写 args/env 时继承 base feature 的对应值。
+# 对具有 modes 的 feature，还可在 base 的某个 mode 下增加：
+#   hardware_overrides.__ASCEND_HARDWARE_ID__.args/env
+#   hardware.__ASCEND_HARDWARE_ID__: unsupported
+# 前者覆盖该 mode 在指定硬件上的参数/环境，后者只在有确认 blocker 时禁用。
+# feature/mode 的 variants 列表和顶层 opt_in_features 不属于本 overlay 可写范围。
+# features:
+#   tool_calling:
+#     hardware_overrides:
+#       __ASCEND_HARDWARE_ID__:
+#         # 【选配；默认继承 base feature.args】此硬件上完整替换该 feature 的
+#         # 参数列表，因此需要写出该路径所需的全部 feature 参数。
+#         args: ["--enable-auto-tool-choice", "--tool-call-parser", "__PARSER__"]
+#         # 【选配；默认继承 base feature.env】只在该 feature 开启时生效。
+#         env:
+#           __FEATURE_ENV_NAME__: "__FEATURE_ENV_VALUE__"
+
+# 【选配；默认沿用 base 的默认开启/关闭规则】列出在该精确 NPU 上需要默认
+# 关闭、由用户主动开启的继承 feature。key 只能是精确硬件 id，value 必须是
+# base 已定义的 feature key。这里不是“禁用特性”；确认不可用时仍需通过
+# feature/mode 的 hardware map 做 unsupported gate。
+# hardware_opt_in_features:
+#   __ASCEND_HARDWARE_ID__: [spec_decoding]
+
+variants:
+  # ==========================================================================
+  # A. variant 通用字段说明（新增 Ascend-only variant 与继承 base variant）
+  # ==========================================================================
+  # 【新增 variant 的条件必填】precision、vram_minimum_gb，以及 overlay 规则
+  # 要求的非空 supported_hardware。key 本身使用小写下划线，如 ascend_w8a8。
+  # 【禁止】不能用新增 default 来覆盖 base.default。继承 base variant 时只能
+  # 追加 OVERLAY_RULES 允许的 Huawei hardware_overrides/tp/supported_hardware，
+  # 不能重写其 precision/model_id/label。
+  #
+  # 新增 variant 时可配置字段及默认值：
+  # - model_id【选配；默认使用 base model.model_id】：实际 Serve/Verify/Bench
+  #   使用的 HF checkpoint。不同量化仓库必须明确写出，格式 org/repo。
+  # - precision【必填】：内部精度元数据，不等同于 UI 名称或 quantization 参数。
+  # - label【选配；默认 precision.toUpperCase()】：用户可见名称。本模板约定
+  #   所有 Ascend 新 variant 显式填写，量化名称中的 ASCEND 全部大写。
+  # - vram_minimum_gb【必填】：容量提示，不是硬件支持门禁。均匀精度按
+  #   ceil(总参数量B × 每参数字节 × 1.2)；MoE 使用包含未激活专家的总参数。
+  #   混合精度必须按真实 checkpoint 权重 footprint × 1.2 计算。
+  # - description【选配；默认无补充说明】：描述权重、量化方式、适用场景和
+  #   限制，不应写未经验证的性能承诺。
+  # - supported_hardware【overlay 新增 variant 必填】：只允许 Huawei id 或
+  #   合法的 Huawei arch selector。它表示 eligibility，不代表 verified。
+  # - min_vllm_version【选配；默认继承 base model.min_vllm_version】：该精度
+  #   所需的最低实际可运行版本，应取高于 base 的真实要求。
+  # - nightly_required【选配；默认 false】：只有稳定版确实不支持时才设为
+  #   true；它只改变安装提示，不能证明 nightly 已包含模型支持。
+  # - base_args【选配；默认继承 model.base_args】：新 variant 可用它“替换”
+  #   基础参数；extra_args 则在此基础上追加。继承 base variant 时不可覆盖它。
+  # - extra_args【选配；默认 []】：该 variant 特有的追加参数。不要在这里写
+  #   由策略统一生成的 TP/PP/DP flag。
+  # - extra_env【选配；默认 {}】：该 variant 所有相关命令都需要的追加环境变量。
+  # - tp【选配；默认按策略和硬件自动推导】：用于 variant 的单机 TP 或硬件 map；
+  #   值必须为正整数。不要在 extra_args 中重复 --tensor-parallel-size。
+  # - install【选配；默认继承 model.install】：按 pip/docker 覆盖安装方式。
+  #   每个安装入口可写 false、null 或 { command?, note? }：false 隐藏入口，
+  #   command 完整替换默认安装命令，note 只增加说明而不替换命令；未写 command
+  #   或 note 时沿用基础生成逻辑。pip/docker 同时 false 会使用户没有安装路径。
+  #   源码支持尚未发布时，pip.command 必须包含完整获取/构建步骤；没有可用
+  #   发布镜像时才设置 docker:false，不能仅因 Docker 更方便就隐藏 pip。
+  # - docker_image【选配；默认继承 base/品牌镜像规则】：variant 级镜像 pin；
+  #   Ascend 量化路径通常更推荐在精确 hardware_overrides 中 pin 已验证镜像。
+  # - supported_features【选配；默认继承全部 base features】：限制该 variant
+  #   可选择的 feature；[] 表示不提供可选 feature，必需参数仍可放 base_args。
+  # - supported_frontends【选配；默认继承可用 frontend】：例如 [python] 可
+  #   禁用 Rust；Python 始终保留为回退。
+  # - precision_hardware【选配；默认使用 precision 的通用硬件约束】：仅在
+  #   特殊 checkpoint 有明确 runtime fallback 时扩大/调整约束，不能用于绕过
+  #   真实不兼容性。
+  # - default_modes【选配；默认不指定】：为 feature 选择默认 mode，并会使
+  #   该 feature 在此 variant 上默认开启；仅适用于 base 已定义 modes 的特性。
+  # - hardware_overrides【选配；默认 {}】：按 generation 或精确硬件追加差异。
+  #   精确硬件块可额外设置 vram_minimum_gb、docker_image、docker_serve_command
+  #   和 install；这些字段不写时分别继承 variant 全局值或基础安装规则。
+  #
+  # 【继承 base variant 时 supported_hardware 的特别风险】如果 base 原本没有
+  # allowlist，不要在 overlay 中凭空创建仅含 Ascend 的列表，否则可能把原有
+  # NVIDIA/AMD eligibility 一并限制掉。只有理解原列表语义时才追加 Ascend id。
+
+  # ------------------------------------------------------------------------
+  # B.【选配】复用 base 的 default/BF16/FP8 checkpoint
+  # ------------------------------------------------------------------------
+  # 优先用于 base 已有目标 variant 的场景。继承的 UI label 仍由 base 决定；
+  # 如需独立的 "BF16 (ASCEND)" 等名称，请改用后面的 Ascend-only variant。
+  # default:
+  #   # 【选配；默认沿用 base/策略 TP】仅追加该 Ascend 硬件的单机 TP。
+  #   tp:
+  #     __ASCEND_HARDWARE_ID__: __BASE_DEFAULT_TP__
+  #   hardware_overrides:
+  #     __ASCEND_HARDWARE_ID__:
+  #       # 【选配；默认继承 base 镜像规则】固定该硬件实际验证过的镜像。
+  #       docker_image: "__ASCEND_DOCKER_IMAGE__"
+  #       # 【选配；默认使用镜像标准入口】只有镜像 ENTRYPOINT 不是 vllm serve
+  #       # 时才设置 docker_serve_command，否则模型 id 可能被误当作可执行文件。
+  #       # docker_serve_command: "vllm serve"
+  #       # 【选配；默认 []/{}】该硬件上的追加参数和环境变量。
+  #       extra_args: []
+  #       extra_env: {}
+  #       # 【选配；默认继承 install】pip:false 只在无 wheel 可运行时隐藏 pip；
+  #       # docker:false 只在无已发布镜像可运行时隐藏 Docker；禁止同时 false。
+  #       # install:
+  #       #   pip: false
+  #       #   docker: false
+  #
+  # fp8:  # base 必须已经定义 fp8；规则与 default 相同。
+  #   hardware_overrides:
+  #     __ASCEND_HARDWARE_ID__:
+  #       docker_image: "__ASCEND_DOCKER_IMAGE__"
+  #       extra_args: []
+  #       extra_env: {}
+
+  # ------------------------------------------------------------------------
+  # C.【条件必填：使用独立 BF16 checkpoint/配置时】Ascend-only BF16 variant
+  # ------------------------------------------------------------------------
+  # 复用 base.default 时删除本块。BF16 不因为运行在 Ascend 就自动需要
+  # --quantization；只有 checkpoint/runtime 文档明确要求时才添加参数。
+  ascend_bf16:
+    # 【选配；默认 base model_id】本例用于独立 BF16 checkpoint，因此显式写出。
+    model_id: "__HF_ORG__/__BF16_HF_REPO__"
+    # 【必填】内部精度。
+    precision: bf16
+    # 【模板约定必填】显式用户可见名称；ASCEND 全大写。
+    label: "BF16 (ASCEND)"
+    # 【必填】ceil(总参数量B × 2 × 1.2)；不是单节点必须满足的硬门禁。
+    vram_minimum_gb: __BF16_VRAM_MINIMUM_GB__
+    # 【选配；默认无说明】记录 BF16 权重及验证边界。
+    description: "__BF16_DESCRIPTION__"
+    # 【overlay 新增 variant 必填】必须非空且全部属于 Huawei scope。
+    supported_hardware: [__ASCEND_HARDWARE_ID__]
+    # 【选配；默认继承 base】低于 base 不会降低 base 的最低版本要求。
+    min_vllm_version: "__BF16_MIN_VLLM_VERSION__"
+    # 【选配；默认 false】只有确实需要 nightly 时取消注释并设 true。
+    # nightly_required: true
+    # 【选配；默认继承 model.base_args】仅在需要完整替换基础参数时使用。
+    # base_args: ["--trust-remote-code"]
+    # 【选配；默认继承全部特性/frontend】按需限制，不提供时删除这两行。
+    # supported_features: [tool_calling, reasoning]
+    # supported_frontends: [python]
+    # 【选配；默认策略自动推导】精确硬件上的单机 TP，必须为正整数。
+    # tp:
+    #   __ASCEND_HARDWARE_ID__: __BF16_SINGLE_NODE_TP__
+    # 【选配；默认使用 precision 通用约束】只有特殊 runtime fallback 才设置。
+    # precision_hardware: { brand: Huawei, generation: npu }
+    # 【选配；默认无 mode 改写】仅当 base feature 已定义对应 mode。
+    # default_modes: { spec_decoding: dspark }
+    # 【选配；默认 []/{}】追加 BF16 特有参数/环境。
+    extra_args: []
+    extra_env: {}
+    hardware_overrides:
+      __ASCEND_HARDWARE_ID__:
+        # 【模板约定必填：Ascend 实际交付】pin 已验证镜像；schema 不写时
+        # 会继承 base/品牌默认，但该默认可能是 NVIDIA 镜像，不能盲目依赖。
+        docker_image: "__BF16_DOCKER_IMAGE__"
+        # 【选配；默认继承 variant 全局 vram_minimum_gb】仅在 GPU-resident
+        # fit budget 与全局值不同且证据明确时覆盖。
+        # vram_minimum_gb: __BF16_GPU_RESIDENT_VRAM_GB__
+        # 【选配；默认标准入口/继承安装路径】需要时设置 docker_serve_command
+        # 或 install.pip/docker；规则与前文一致。
+        # docker_serve_command: "vllm serve"
+        # install:
+        #   pip: false
+        extra_args: []
+        extra_env: {}
+
+  # 【选配】独立 FP8 checkpoint。字段默认值与 ascend_bf16 相同；没有证据
+  # 表明需要 quantization flag 时保持 extra_args 为空。
+  ascend_fp8:
+    model_id: "__HF_ORG__/__FP8_HF_REPO__"       # 【选配；默认 base model_id】
+    precision: fp8                              # 【必填】
+    label: "FP8 (ASCEND)"                      # 【模板约定必填】
+    vram_minimum_gb: __FP8_VRAM_MINIMUM_GB__    # 【必填】通常按 1 字节/参数×1.2
+    description: "__FP8_DESCRIPTION__"          # 【选配】
+    supported_hardware: [__ASCEND_HARDWARE_ID__] # 【overlay 新增 variant 必填】
+    min_vllm_version: "__FP8_MIN_VLLM_VERSION__" # 【选配；默认继承 base】
+    extra_args: []                              # 【选配；默认 []】
+    extra_env: {}                               # 【选配；默认 {}】
+    hardware_overrides:
+      __ASCEND_HARDWARE_ID__:
+        docker_image: "__FP8_DOCKER_IMAGE__"     # 【模板约定必填】已验证镜像
+        extra_args: []
+        extra_env: {}
+
+  # ==========================================================================
+  # D. Ascend 量化 variants
+  # ==========================================================================
+  # label、precision、checkpoint 格式和 runtime quantization 是四个独立事实。
+  # 所有新增量化 variant 都必须有真实 checkpoint，并按目标模型发布的命名习惯
+  # 显式设置 label；量化名称中的 ASCEND 必须全部大写。
+
+  # 【条件必填：模型提供 W8A8 Ascend checkpoint 时】int8 + Ascend backend。
+  ascend_w8a8:
+    model_id: "__HF_ORG__/__W8A8_HF_REPO__"
+    precision: int8
+    label: "W8A8 (ASCEND)"
+    vram_minimum_gb: __W8A8_VRAM_MINIMUM_GB__
+    description: "__W8A8_DESCRIPTION__"
+    supported_hardware: [__ASCEND_HARDWARE_ID__]
+    min_vllm_version: "__W8A8_MIN_VLLM_VERSION__"
+    # 【条件必填：权重与 runtime 文档要求时】不要仅凭 variant 名称猜测。
+    extra_args: ["--quantization", "ascend"]
+    extra_env: {}
+    hardware_overrides:
+      __ASCEND_HARDWARE_ID__:
+        docker_image: "__W8A8_DOCKER_IMAGE__"
+        extra_args: []
+        extra_env: {}
+
+  # 【条件必填：模型提供 W8A8 MXFP8 Ascend checkpoint 时】
+  # precision 为 mxfp8，但该 Ascend 量化路径仍使用 --quantization ascend。
+  # 禁止因为看到 MXFP8 就改成原生 --quantization mxfp8。
+  ascend_w8a8_mxfp8:
+    model_id: "__HF_ORG__/__W8A8_MXFP8_HF_REPO__"
+    precision: mxfp8
+    label: "W8A8 MXFP8 (ASCEND)"
+    vram_minimum_gb: __W8A8_MXFP8_VRAM_MINIMUM_GB__
+    description: "__W8A8_MXFP8_DESCRIPTION__"
+    supported_hardware: [__ASCEND_HARDWARE_ID__]
+    min_vllm_version: "__W8A8_MXFP8_MIN_VLLM_VERSION__"
+    extra_args: ["--quantization", "ascend"]
+    extra_env: {}
+    hardware_overrides:
+      __ASCEND_HARDWARE_ID__:
+        docker_image: "__W8A8_MXFP8_DOCKER_IMAGE__"
+        extra_args: []
+        extra_env: {}
+
+  # 【条件必填：模型提供 W4A8 Ascend checkpoint 时】int4 + Ascend backend。
+  ascend_w4a8:
+    model_id: "__HF_ORG__/__W4A8_HF_REPO__"
+    precision: int4
+    label: "W4A8 (ASCEND)"
+    vram_minimum_gb: __W4A8_VRAM_MINIMUM_GB__
+    description: "__W4A8_DESCRIPTION__"
+    supported_hardware: [__ASCEND_HARDWARE_ID__]
+    min_vllm_version: "__W4A8_MIN_VLLM_VERSION__"
+    extra_args: ["--quantization", "ascend"]
+    extra_env: {}
+    hardware_overrides:
+      __ASCEND_HARDWARE_ID__:
+        docker_image: "__W4A8_DOCKER_IMAGE__"
+        extra_args: []
+        extra_env: {}
+
+  # 【条件必填：模型提供 W4A4/MXFP4 Ascend checkpoint 时】
+  # 内部 precision 是 mxfp4，用户可见名称仍是 W4A4 (ASCEND)，不能改成 W4A8
+  # 或 MXFP4 (ASCEND)，也不代表应使用原生 mxfp4 backend。
+  ascend_w4a4_mxfp4:
+    model_id: "__HF_ORG__/__W4A4_MXFP4_HF_REPO__"
+    precision: mxfp4
+    label: "W4A4 (ASCEND)"
+    vram_minimum_gb: __W4A4_MXFP4_VRAM_MINIMUM_GB__
+    description: "__W4A4_MXFP4_DESCRIPTION__"
+    supported_hardware: [__ASCEND_HARDWARE_ID__]
+    min_vllm_version: "__W4A4_MXFP4_MIN_VLLM_VERSION__"
+    extra_args: ["--quantization", "ascend"]
+    extra_env: {}
+    hardware_overrides:
+      __ASCEND_HARDWARE_ID__:
+        docker_image: "__W4A4_MXFP4_DOCKER_IMAGE__"
+        extra_args: []
+        extra_env: {}
+
+  # 【选配】原生 MXFP8 路径，必须与上面的 W8A8 MXFP8 (ASCEND) 分开。
+  # 只有 checkpoint/runtime 明确文档化原生 backend 时保留。硬件后缀如
+  # "MXFP8 (ASCEND A5)" 只能用于确实只验证了 A5 的场景，不能泛化。
+  ascend_mxfp8:
+    model_id: "__HF_ORG__/__NATIVE_MXFP8_HF_REPO__"
+    precision: mxfp8
+    label: "MXFP8 (ASCEND)"
+    vram_minimum_gb: __NATIVE_MXFP8_VRAM_MINIMUM_GB__
+    description: "__NATIVE_MXFP8_DESCRIPTION__"
+    supported_hardware: [__ASCEND_HARDWARE_ID__]
+    min_vllm_version: "__NATIVE_MXFP8_MIN_VLLM_VERSION__"
+    # 【条件必填：原生 MXFP8 文档明确给出时】以下仅是原生路径示例；如果
+    # checkpoint/runtime 合同不同，必须修改或删除，不能复制到 W8A8 MXFP8。
+    extra_args:
+      - "--quantization"
+      - "mxfp8"
+      - "--dtype"
+      - "bfloat16"
+      - "--kv-cache-dtype"
+      - "fp8"
+    extra_env: {}
+    hardware_overrides:
+      __ASCEND_HARDWARE_ID__:
+        docker_image: "__NATIVE_MXFP8_DOCKER_IMAGE__"
+        extra_args: []
+        extra_env: {}
+
+# 【选配；默认继承 base/策略自身的设备数规则】为某个精确 Ascend 硬件设置
+# 模型级最低设备数。value 必须是正整数。多节点策略会增加节点数以满足 floor；
+# 单节点策略无法满足时会从可选列表移除。它不是 VRAM 硬门禁，也不能代替实测。
+# 只读取精确硬件 id 的条件 floor，不能使用 npu generation 代替精确 id。
+# strategy_min_gpus:
+#   __ASCEND_HARDWARE_ID__:
+#     multi_node_dep: __MULTI_NODE_DEP_MIN_GPUS__
+#     pd_cluster: __PD_MIN_GPUS__
+
+# 【条件必填：需要向 Ascend 开放策略时】逐策略设置硬件可用状态。
+# 【默认】base compatible_strategies 已列出的策略默认在所有硬件可用，未列出
+# 的默认不可用；strategy_hardware.supported 可对指定硬件追加开放，unsupported
+# 可对指定硬件明确禁用。仅“未测试”不应写 unsupported。
+strategy_hardware:
+  # 【本模板基线必选】单节点纯 TP。生成 --tensor-parallel-size，不包含多节点
+  # rendezvous 参数。实际 TP 可由 variant/preset 的 tp 进一步限定。
+  single_node_tp:
+    __ASCEND_HARDWARE_ID__: supported
+
+  # 【条件必填：多节点纯 TP】生成每个节点不同的 head/worker 命令，通常总 TP
+  # 随节点数增长；必须验证 node-rank/master/headless，不能重复复制 rank1。
+  multi_node_tp:
+    __ASCEND_HARDWARE_ID__: supported
+
+  # 【条件必填：TP+PP】节点内 TP、跨节点 PP；没有 single_node_tp_pp。
+  # 不允许通过 extra_args 再写一套 TP/PP 覆盖策略生成值。
+  multi_node_tp_pp:
+    __ASCEND_HARDWARE_ID__: supported
+
+  # 【条件必填：TP+DP】节点内 TP、跨节点 DP，生成 local DP=1；它不是任意
+  # local DP 拓扑，也没有 single_node_tp_dp。worker node N 对应相应 DP rank。
+  multi_node_tp_dp:
+    __ASCEND_HARDWARE_ID__: supported
+
+  # 【条件必填：MoE 且验证单机 DEP】数据并行+专家并行。该策略不能被描述为
+  # 可独立设置任意 TP 的完整 DP+TP+EP；显式 TP 的此类拓扑请使用 PD DEP role。
+  single_node_dep:
+    __ASCEND_HARDWARE_ID__: supported
+
+  # 【条件必填：MoE 且验证多节点 DEP】生成 EP/DP 和逐节点命令。
+  multi_node_dep:
+    __ASCEND_HARDWARE_ID__: supported
+
+  # 【条件必填：PD 分离】本模板支持的交付路径是下方 ascend_pd preset。
+  # 当前 YAML 无法全局禁止 Baseline 或其他 Router，验证声明不能覆盖这些路径。
+  pd_cluster:
+    __ASCEND_HARDWARE_ID__: supported
+
+# 【选配；默认不增加硬件级参数】用于该硬件上所有 variant、所有策略都必须
+# 具备的公共行为。key 可用精确 Ascend id 或 npu；只有整个 generation 都经过
+# 验证时才建议使用 npu，否则使用精确 id。模型/变体/策略/ benchmark 专属
+# 参数不应放在这里。
+hardware_overrides:
+  __ASCEND_HARDWARE_ID__:
+    # 【选配；默认 []/{}】追加公共参数和环境变量；不要写策略拓扑 flag。
+    extra_args: []
+    extra_env: {}
+    # 【选配；默认无额外安装说明】在 Install 区域显示硬件相关注意事项，
+    # 不替代真实的 model/variant install 或可用镜像。
+    install_note: "__ASCEND_INSTALL_NOTE__"
+
+# 【选配；默认无硬件提示】在命令区域旁显示简短的硬件前提说明。
+hardware_notes:
+  __ASCEND_HARDWARE_ID__:
+    # 【选配；默认无标题】建议保持短语；body【必填：保留本项时】为说明正文。
+    title: "Ascend prerequisites"
+    body: "__ASCEND_HARDWARE_NOTE__"
+    # 【选配；默认无链接】href 必须是可访问的安全 URL，label 为链接文字。
+    link:
+      href: "__ASCEND_HARDWARE_DOCS_URL__"
+      label: "Ascend deployment documentation"
+
+# 【选配；默认使用 base 与策略标准生成逻辑】只放“选择该硬件+策略的所有
+# 用户都需要”的差异。调优 lane、特定并发和 PD 拓扑应放 preset。
+strategy_overrides:
+  single_node_tp:
+    hardware_overrides:
+      __ASCEND_HARDWARE_ID__:
+        # 【选配；默认 []/{}】单机 TP 的公共追加参数/环境。
+        extra_args: []
+        extra_env: {}
+
+  multi_node_tp:
+    hardware_overrides:
+      __ASCEND_HARDWARE_ID__:
+        extra_args: []
+        extra_env: {}
+
+  multi_node_tp_pp:
+    hardware_overrides:
+      __ASCEND_HARDWARE_ID__:
+        extra_args: []
+        extra_env: {}
+        # 【禁止】不要注入 --tensor-parallel-size/--pipeline-parallel-size；
+        # 节点内 TP 和跨节点 PP 由策略及节点数统一生成。
+
+  multi_node_tp_dp:
+    hardware_overrides:
+      __ASCEND_HARDWARE_ID__:
+        extra_args: []
+        extra_env: {}
+        # 【禁止】不要用 raw args 改写 DP size/local size/rank。
+
+  multi_node_dep:
+    hardware_overrides:
+      __ASCEND_HARDWARE_ID__:
+        extra_args: []
+        extra_env: {}
+
+  # 【选配：base 已是 map 时】overlay 只能给 PD role 的 tp/pp map 追加 Huawei
+  # key；base 是 scalar 时禁止提升为 map，应改用 preset。
+  # 【默认】role parallelism 默认 tp；DEP 的 tp 默认 1、pp 默认 1；TP/TEP
+  # 忽略 role.tp，并由 pool_devices/pp 推导。role nodes/parallelism/pool_modes
+  # 不是 overlay 可写字段，必须在 preset.roles 中配置。
+  # pd_cluster:
+  #   prefill:
+  #     pp:
+  #       __ASCEND_HARDWARE_ID__: __PD_PREFILL_PP__
+  #   decode:
+  #     tp:
+  #       __ASCEND_HARDWARE_ID__: __PD_DECODE_TP__
+  #     pp:
+  #       __ASCEND_HARDWARE_ID__: 1
+
+# 【选配；默认 fail-open】只有确认某 Mooncake store 模式在该硬件不可用时
+# 才标 unsupported。未写表示不主动禁用，不能将“未测试”写成 unsupported。
+# kv_cache_strategy_hardware:
+#   kv_store_distributed_mooncake:
+#     __ASCEND_HARDWARE_ID__: unsupported
+#   kv_store_centralized_mooncake:
+#     __ASCEND_HARDWARE_ID__: unsupported
+
+# ============================================================================
+# Preset 通用字段教程
+# ============================================================================
+# preset 是“一个精确硬件 + 可选策略/variants”的有证据配置 delta，不是通用
+# 硬件支持声明。每个 preset 或 point 都会严格渲染，错误会直接使构建失败。
+#
+# - label【必填：保留 preset 时】：Preset 行的显示名。
+# - hardware【必填】：一个精确 Ascend 硬件 id，不能使用 npu。
+# - strategy【选配；默认应用于所有策略】：roles 仅允许 strategy=pd_cluster。
+# - variants【选配；默认应用于全部 variants】：限定已验证的 variant key。
+# - default【选配；默认 false】：true 表示该硬件+策略+variants 默认启用；
+#   同一组合最多一个 default。benchmark-only lane 应保持 opt-in。
+# - description/workload【选配；默认无】：说明用途及工作负载，不写虚假数据。
+# - source【模板约定必填】：href 为证据链接；key/revision 记录 lane 与版本。
+#   source.href 在 schema 中若提供 source 则必填；label/key/revision 用于完整
+#   证据追溯，本模板不允许只放一个无上下文的链接。
+# - image【选配；默认继承普通安装/镜像规则】：字符串或对象。对象可含 vllm、
+#   dynamo、pip、model_revision；Ascend 通常只使用 vllm/model_revision/pip，
+#   dynamo 仅适用于相应 Dynamo 路径，不应无故填写。
+# - select【选配；默认不改变 builder 其他选择】：可含 nodes、pd_router、
+#   pd_connector、frontend、features、dcp、kv_offload。nodes 用于多节点；
+#   features 用 true/false 或 mode key；dcp 为正整数；kv_offload 为合法选项
+#   或 off。pd_router 未指定时通常为 vllm，pd_connector 未指定时使用 catalog
+#   default（当前为 nixl）；Ascend PD 的两个选项必须显式指定，不能依赖默认。
+# - args/env【选配；默认无 delta】：应用到所有节点、PD 两个 role 的共享增量。
+# - tp【选配；仅 single_node_tp preset】：设置该 preset 的单机 TP。
+# - remove_args【选配；默认 []】：删除继承 flag 及其值，不存在时 no-op。
+# - json_args【选配；默认 {}】：深合并 JSON flag；null 删除 key，缺失的
+#   非 toggle-owned flag 可新增，toggle-owned flag 只在 toggle 开启时编辑。
+# - roles【条件必填：PD 拓扑需要预设时】：prefill/decode 可分别设置 nodes、
+#   parallelism、tp、pp、args、env、remove_args、json_args。
+#   parallelism 默认 tp；DEP tp 默认 1、pp 默认 1；TP/TEP 的 tp 被忽略并由
+#   pool devices/pp 推导；nodes 未写时继承 base role/当前选择，交付时应显式。
+# - points【选配；默认无 Point 行】：每个 point 必须有 label，可含 concurrency、
+#   default 和 preset 同款 delta。concurrency 只是信息字段，不会自动变成启动
+#   参数；没有 default:true 时使用第一个 point。point 不能改变 hardware、
+#   strategy、variants，需要这些变化时应新建 preset。
+# - runbook【选配；默认无】：记录证据、复现条件和限制。只允许 builder 无法
+#   表达的外部服务命令，不重复 builder 已生成的引擎命令或环境块。
+
+presets:
+  # 【选配】非 PD 调优 preset。只有具备证据时才取消注释；所有省略字段按
+  # 上述默认规则处理。以下分别演示 single_node_tp.tp 和多节点 select.nodes。
+  # ascend_single_node_tp:
+  #   label: "Ascend single-node TP"
+  #   hardware: __ASCEND_HARDWARE_ID__
+  #   strategy: single_node_tp
+  #   variants: [__PRESET_VARIANT_KEY__]
+  #   default: false
+  #   description: "__TP_PRESET_DESCRIPTION__"
+  #   source:
+  #     label: "__TP_PRESET_SOURCE_LABEL__"
+  #     href: "__TP_PRESET_SOURCE_URL__"
+  #     key: "__TP_PRESET_SOURCE_KEY__"
+  #     revision: "__TP_PRESET_SOURCE_REVISION__"
+  #   image:
+  #     vllm: "__TP_PRESET_DOCKER_IMAGE__"
+  #     model_revision: "__TP_PRESET_MODEL_REVISION__"
+  #   tp: __TP_PRESET_TP__  # 仅 single_node_tp preset 使用；默认自动推导。
+  #   args: []
+  #   env: {}
+  #   remove_args: []
+  #
+  # ascend_multi_node_tp_pp:
+  #   label: "Ascend multi-node TP+PP"
+  #   hardware: __ASCEND_HARDWARE_ID__
+  #   strategy: multi_node_tp_pp
+  #   variants: [__PRESET_VARIANT_KEY__]
+  #   default: false
+  #   source:
+  #     href: "__TP_PP_PRESET_SOURCE_URL__"
+  #     key: "__TP_PP_PRESET_SOURCE_KEY__"
+  #     revision: "__TP_PP_PRESET_SOURCE_REVISION__"
+  #   image: "__TP_PP_PRESET_DOCKER_IMAGE__"
+  #   select:
+  #     nodes: __TP_PP_PRESET_NODES__  # 本例 >=2；不写时按当前策略规则选择。
+  #   args: []
+  #   env: {}
+  #   remove_args: []
+
+  # ==========================================================================
+  # Ascend PD 分离部署教程（与下方 ascend_pd 字段一一对应）
+  # ==========================================================================
+  # 【步骤 1：固定输入版本】确认 base recipe、renderer（包含 recipes#1226 或
+  # 兼容后续实现）、vLLM/vLLM Ascend runtime、镜像、checkpoint revision 和
+  # Mooncake/proxy 都已发布且相互兼容。内部或未合入支持不能写成公开能力。
+  #
+  # 【步骤 2：计算物理拓扑】先记录每节点设备数，再确定 P/D 节点数：
+  # - TP/TEP role：pool_devices = nodes × devices_per_node，TP=pool_devices/pp；
+  #   pp 必须整除 pool_devices，role.tp 对 TP/TEP 无效。
+  # - DEP role：local_dp = devices_per_node / tp，global_dp = nodes × local_dp；
+  #   tp 必须整除每节点设备数，且 pp=1。
+  # 示例（8 设备/节点）：Prefill nodes=2、tp、pp=2 → TP8/PP2；Decode
+  # nodes=2、dep、tp=4 → local DP2/global DP4。增加 Decode 节点只扩大 global
+  # DP，不改变 TP4/local DP2；增加 TP/PP Prefill 节点会改变总 TP。
+  #
+  # 【步骤 3：填写基础选择】在 meta.hardware 和 variants 中开放目标硬件及
+  # 精度，在 strategy_hardware.pd_cluster 开放 PD，并确保 preset.hardware 与
+  # preset.variants 精确匹配。Ascend Router 和 Mooncake (Ascend) 不能仅靠 URL
+  # 参数开启，active preset 必须同时声明 select.pd_router=ascend 和
+  # select.pd_connector=mooncake_ascend。
+  #
+  # 【步骤 4：处理继承参数】Ascend Router 使用 external DP。保留下方共享
+  # remove_args:["--data-parallel-hybrid-lb"] 清除 base 可能留下的 hybrid-LB；
+  # 不要删除合成器根据拓扑生成的 external-LB。若需修改 Mooncake 实现，使用
+  # role json_args 按 MooncakeConnectorV2 名称编辑，不整段覆盖 connector。
+  #
+  # 【步骤 5：执行严格校验】运行：
+  #   node scripts/validate-source.mjs --source vllm-ascend --dir /path/to/vllm-ascend/recipes
+  # 构建会严格渲染每个 preset/point；拓扑不能整除、DEP pp>1、connector 无
+  # 有效名称、LB 冲突或 variant 不匹配都必须视为配置错误，而不是跳过。
+  #
+  # 【步骤 6：检查生成产物】打开生成的：
+  #   public/__HF_ORG__/__HF_REPO__/presets/ascend_pd.json
+  # 核对 points.default.prefill/decode.node_commands、pd_router、pd_connector、
+  # 每个 --kv-transfer-config、所有 DP rank 和 router.command。Prefill/Decode
+  # 的每个节点都必须使用自己的 node_commands，不能把 rank1 命令复制到全部节点。
+  #
+  # 【步骤 7：准备节点地址和端口】按实际环境设置生成命令中的 PREFILL_NODE_n、
+  # DECODE_NODE_n、ROUTER_HOST、ROUTER_PORT、HEAD_IP/IFACE 等地址变量。
+  # 检查 DP rank HTTP 端口、KV 端口和代理端口不冲突；local DP>1 时子 rank
+  # 端口按 base_port+local_rank 增长，并避开 supervisor 健康端口（默认 9256）。
+  #
+  # 【步骤 8：启动 Prefill 与 Decode workers】把 JSON/Markdown 中对应 rank 的
+  # 命令分别放到相应物理节点执行。native vLLM 负责 worker 启动、设备切片、
+  # rank 和端口监督。先确认所有 P/D 节点及每个 DP rank 健康，再检查 Router。
+  #
+  # 【步骤 9：启动 Ascend Router】在 Router 节点执行生成的 router.command。
+  # Ascend Router 是代理/路由组件，负责把请求转发到生成的 rank endpoints；
+  # 它不是 worker 进程 launcher。local DP1 与 local DP>1 的 endpoint 数量不同，
+  # 必须检查没有重复 rank0、遗漏末尾 rank 或错误的 HTTP 端口。
+  #
+  # 【步骤 10：端到端验收】依次验证所有 worker/rank 的 /health、Router 的
+  # /v1/models，以及通过 Router 的有效生成（finish_reason: stop）。检查日志
+  # 确认请求确实经过 Ascend Router 且发生 Mooncake KV transfer，而不是绕过
+  # Router 直连单个 worker。只有这些证据齐全后才能把对应范围标为 verified。
+  #
+  # 【步骤 11：扩容或修改拓扑】只修改 roles.nodes/parallelism/tp/pp 或 point
+  # 的对应字段，重新执行步骤 5-10。不要手改生成命令中的 DP size/rank，否则
+  # connector 中的 dp/tp/pp_size 和 Router endpoints 会与 worker 脱节。
+  #
+  # 【步骤 12：故障定位】LB 冲突先查 base 是否留下 hybrid/external flag；
+  # rank 无法 join 查地址、HCCL 和 start-rank；Router 502 查 endpoint/端口；
+  # KV 失败查 connector 实现、版本和 MultiConnector；权限/镜像问题先确认
+  # checkpoint revision、镜像 digest 和运行时能力，不要仅靠静态 CI 判断。
+
+  # 【条件必填：交付 Ascend PD 时】保持 default:false，除非该精确拓扑确实是
+  # 所有匹配用户都应使用的默认配置。preset 必须同时匹配 hardware 和 variant。
+  ascend_pd:
+    # 【必填】Preset 显示名，建议包含明确的 P/D 或并发拓扑。
+    label: "Ascend PD (__PD_TOPOLOGY_LABEL__)"
+    # 【必填】一个精确 Ascend hardware id。
+    hardware: __ASCEND_HARDWARE_ID__
+    # 【必填：使用 roles 时】固定为 pd_cluster。
+    strategy: pd_cluster
+    # 【模板约定必填；默认所有 variants】只列已完成该 PD lane 验证的 variant，
+    # 例如 [ascend_w8a8_mxfp8]；删除 variant 时必须同步修改这里。
+    variants: [__PD_VARIANT_KEY__]
+    # 【选配；默认 false】保持 opt-in，避免未普遍验证的 lane 取代 Baseline。
+    default: false
+    # 【选配；默认无】说明适用场景、限制及工作负载。
+    description: "__PD_DESCRIPTION__"
+    workload: "__PD_WORKLOAD__"
+    # 【模板约定必填】证据来源。href 必须可访问；key/revision 对应实际 lane
+    # 和运行版本，source.revision 在配置或证据变化时同步更新。
+    source:
+      label: "__PD_SOURCE_LABEL__"
+      href: "__PD_SOURCE_URL__"
+      key: "__PD_SOURCE_KEY__"
+      revision: "__PD_SOURCE_REVISION__"
+    image:
+      # 【模板约定必填】已发布且验证过的镜像 tag/digest，必须包含所需
+      # external-DP、multi-port、Mooncake 和匹配 proxy。未写时继承普通镜像，
+      # 但不能保证该默认镜像支持 Ascend PD。
+      vllm: "__PD_DOCKER_IMAGE__"
+      # 【模板约定必填】实际服务的模型 revision；只作证据和发布信息，
+      # 不会替代 variant.model_id。
+      model_revision: "__PD_MODEL_REVISION__"
+      # 【选配；默认无额外 pip 列表】只列该 lane 额外需要的包及固定版本。
+      # pip: ["__PD_EXTRA_PACKAGE_PIN__"]
+      # 【选配：Dynamo 专用】Ascend Router 路径不使用，勿无依据填写 dynamo。
+    select:
+      # 【条件必填】二者必须同时存在，URL/API 不能绕过 preset 声明。
+      pd_router: ascend
+      pd_connector: mooncake_ascend
+      # 【选配；默认继承 model/variant frontend】本模板以实际验证的 Python
+      # frontend 为例；修改前需验证 Rust frontend 与 parser/runtime 兼容。
+      frontend: python
+      # 【选配；默认不改变 feature 选择】示例：
+      # features: { spec_decoding: false, tool_calling: true }
+      # 【选配；默认不额外指定 DCP/KV Offload】仅填写已验证的合法选项：
+      # dcp: 1
+      # kv_offload: off
+    # 【选配；默认无共享 delta】同时作用于两个 role 和每个节点。拓扑只能
+    # 放 roles，不要用这些参数再写 TP/PP/DP。
+    args: []
+    env: {}
+    # 【本模板 PD 必需】清除 base 可能继承的 hybrid-LB；不存在时 no-op。
+    # 不要移除当前拓扑生成的 external-LB flag。
+    remove_args: ["--data-parallel-hybrid-lb"]
+    roles:
+      prefill:
+        # 【模板约定必填；默认继承 base role/当前选择】专用 Prefill 节点数。
+        # 当前只支持一个 pool，不能表达独立 replica groups。
+        nodes: __PD_PREFILL_NODES__
+        # 【选配；默认 tp】可选 tp|tep|dep。本例 TP 由 pool_devices/pp 推导。
+        parallelism: tp
+        # 【选配；默认 1】PP 必须整除 pool_devices；TP/TEP role 的 tp 被忽略。
+        pp: __PD_PREFILL_PP__
+        # 【选配；默认无 role delta】只放 Prefill 特有非拓扑参数/环境。
+        args: []
+        env: {}
+        # 【选配；默认 []】删除该 role 的继承 flag，追加在共享 remove_args 后。
+        remove_args: []
+      decode:
+        # 【模板约定必填】专用 Decode 节点数。
+        nodes: __PD_DECODE_NODES__
+        # 【条件必填：显式 DP+TP+EP】dep 表示数据+专家并行。
+        parallelism: dep
+        # 【选配；默认 1】DEP 的 TP 宽度，必须整除每节点设备数。
+        # local_dp=devices_per_node/tp，global_dp=nodes×local_dp，pp 必须为 1。
+        # external DEP 仅适用于 MoE 且 role 必须使用独立节点（nodes>=1）：
+        # - global DP=1：不生成 DP rank/start-rank 或 external-LB，Router 仅一个
+        #   适用 endpoint，connector dp_size=1；
+        # - global DP>1 且 local DP=1：生成 --data-parallel-rank 和
+        #   --data-parallel-external-lb，每个节点一个 rank endpoint；
+        # - local DP>1：生成 --data-parallel-start-rank 和
+        #   --data-parallel-multi-port-external-lb，本地 rank 使用
+        #   start_rank+local_rank 与 base_port+local_rank，Router 列出全部 rank。
+        tp: __PD_DECODE_TP__
+        pp: 1
+        # 【选配；默认无 role delta】不要在这里覆盖 DP size/rank/LB。
+        args: []
+        env: {}
+        remove_args: []
+
+        # 【选配；默认继承 MooncakeConnectorV2 catalog 配置】按名称做 JSON
+        # 深合并，适用于 V1/V2/Hybrid 或实现特定设置；null 删除继承 key。
+        # 不要把 MultiConnector 根 kv_connector 改成具体实现，也不要假设
+        # 所有 runtime 都支持 V1/V2/Hybrid。最终 transfer config 必须是 JSON
+        # 对象且含非空 kv_connector。
+        # json_args:
+        #   --kv-transfer-config:
+        #     MooncakeConnectorV2:
+        #       kv_connector: MooncakeHybridConnector
+
+    # 【选配；默认无 Point 行】每个 point 使用真实测量 operating point。
+    # label 必填；concurrency 仅作展示；没有 default:true 时选择第一个 point。
+    # point 可覆盖 args/env/remove_args/json_args/tp/roles/select/image，但不能
+    # 改 hardware、strategy、variants。
+    # points:
+    #   c16:
+    #     label: "16"
+    #     concurrency: 16
+    #     default: true
+    #     roles:
+    #       decode:
+    #         args: ["--max-num-seqs", "__PD_C16_MAX_NUM_SEQS__"]
+    #   c32:
+    #     label: "32"
+    #     concurrency: 32
+    #     roles:
+    #       decode:
+    #         args: ["--max-num-seqs", "__PD_C32_MAX_NUM_SEQS__"]
+
+    # 【模板约定必填】记录证据、复现条件和限制，不重复 builder 已生成的
+    # 引擎命令或环境块。以下步骤与上方注释教程对应，提交前替换全部占位符。
+    runbook: |
+      ## 证据与版本
+
+      - 来源及 revision：__PD_SOURCE_LABEL__ / __PD_SOURCE_REVISION__
+      - 模型 revision：__PD_MODEL_REVISION__
+      - Runtime/镜像 digest：__PD_DOCKER_IMAGE__
+      - 硬件和物理拓扑：__PD_HARDWARE_TOPOLOGY__
+      - 验证证据：__PD_VERIFICATION_EVIDENCE_URL__
+      - 未验证 variant、特性和限制：__PD_UNVERIFIED_LIMITS__
+
+      ## 部署步骤
+
+      1. 核对每个节点的 runtime、镜像、模型 revision 和网络配置一致。
+      2. 按 preset 拓扑准备独立 Prefill/Decode 节点及全部地址变量和端口。
+      3. 运行 validate-source，检查本 preset JSON 中每个 node_commands、
+         connector 配置和 router.command。
+      4. 在各物理节点执行对应 rank 的 worker 命令，确认所有 worker/rank 健康。
+      5. 在 Router 节点执行生成的代理命令，检查所有 rank endpoint 均已注册。
+      6. 通过 Ascend Router 验证 /v1/models 和有效生成，并确认 Mooncake KV
+         transfer 成功。完成这些步骤前，不得将本 preset 标为 verified。
+
+      ## 部署约束
+
+      使用专用 Prefill 和 Decode 主机。确认镜像提供所需 external-DP flag 和
+      匹配的 Ascend proxy 脚本。local-rank HTTP 端口必须避开 supervisor 健康
+      端口（默认 9256）。Ascend Router 负责代理和路由，native vLLM 负责
+      worker 启动与监督；每个角色只有一个 pool，不支持独立 replica groups。
+
+# 【选配；默认无配置专属提示】overlay notes 必须包含非空且全部 Huawei 的
+# when.hardware。when 的不同 key 之间为 AND，同一 key 的列表值为 OR。
+# - title【选配；默认无标题】：提示标题。
+# - when.hardware【overlay 必填】：精确硬件/generation/brand 等合法选择器。
+# - when.strategies/variants/features【选配；默认不限制对应维度】：分别按
+#   策略、variant 和开启的 feature 过滤。
+# - body【必填：保留 note 时】：只写当前配置读者需要的信息；recipe 级别的
+#   通用叙述放 guide_sections，已确认的故障症状和修复放合适的 owner 文档。
+notes:
+  - title: "Ascend PD requires the qualified preset"
+    when:
+      hardware: [__ASCEND_HARDWARE_ID__]
+      strategies: [pd_cluster]
+      # variants: [__PD_VARIANT_KEY__]
+      # features: [spec_decoding]
+    body: |
+      The supported PD path is the `ascend_pd` preset for the matching variant
+      and hardware. It selects Ascend Router and Mooncake (Ascend), with native
+      vLLM external-DP workers. Baseline and other router choices are not covered
+      by this overlay's verification claim; current schema cannot globally ban them.
+
+# 【选配；默认不增加 Ascend 文档段】guide_sections 的 key 是 section 名称。
+# 名为 ascend 的内容会优先填充 base 中的
+# <!-- overlay:vllm-ascend:ascend --> 标记；没有对应标记时追加到 guide 末尾。
+# 未填充的 marker 会被移除。这里只写概述、前置条件、客户端用法、证据和参考
+# 链接，不重复 builder 能生成的 vllm serve、环境 exports 或“在 builder 选择
+# 某选项”的操作步骤。PD 的字段说明和部署顺序放在 preset/注释/runbook 中。
+guide_sections:
+  ascend: |
+    ## Ascend overview
+
+    __ASCEND_GUIDE_OVERVIEW__
+
+    Tested scope: __ASCEND_TESTED_SCOPE__. Advertised but untested capabilities:
+    __ASCEND_UNTESTED_SCOPE__. Do not infer that one variant's result verifies
+    every precision, topology, or optional feature.
+
+    ## Ascend prerequisites
+
+    - Hardware and node topology: __ASCEND_PREREQUISITE_TOPOLOGY__
+    - vLLM / vLLM Ascend runtime commit or release: __ASCEND_RUNTIME_VERSION__
+    - Verified image and digest: __ASCEND_RUNTIME_IMAGE__
+    - Checkpoint revisions: __ASCEND_CHECKPOINT_REVISIONS__
+    - Host/driver/network prerequisites: __ASCEND_HOST_PREREQUISITES__
+
+    ## Client usage
+
+    ```python
+    from openai import OpenAI
+
+    client = OpenAI(
+        base_url="http://__ASCEND_CLIENT_HOST__:__ASCEND_CLIENT_PORT__/v1",
+        api_key="EMPTY",
+    )
+    response = client.chat.completions.create(
+        model="__ASCEND_SERVED_MODEL_ID__",
+        messages=[{"role": "user", "content": "Hello"}],
+    )
+    print(response.choices[0].message.content)
+    ```
+
+    ## Ascend references
+
+    - [Canonical model card](https://huggingface.co/__HF_ORG__/__HF_REPO__)
+    - [Base recipe](https://github.com/vllm-project/vllm/blob/main/recipes/models/__HF_ORG__/__HF_REPO__.yaml)
+    - [Ascend deployment documentation](__ASCEND_HARDWARE_DOCS_URL__)
+    - [Ascend PD design/evidence](__PD_SOURCE_URL__)
+    - [Ascend Mooncake multi-node PD documentation](https://docs.vllm.ai/projects/ascend/en/latest/tutorials/features/pd_disaggregation_mooncake_multi_node.html)
+
+# ============================================================================
+# 提交前禁止项与最终检查
+# ============================================================================
+# 【禁止】不要添加以下 overlay 不可写字段：
+# - model、compatible_strategies、顶层 guide、opt_in_features、
+#   kv_offload_support、troubleshooting、default_strategy、pool_modes；
+# - meta.title/model/default_hardware/default_variant 或用于替换 base 的
+#   default variant（本 overlay 仅使用 meta.hardware/date_updated）；
+# - NVIDIA/AMD 硬件 key、CUDA/NCCL 专属配置、非 Huawei dependency；
+# - 与策略/preset 合成器冲突的 raw TP/PP/DP 参数、旧 launcher/grouped 字段；
+# - 用 unsupported 表示未测试、未验证的性能声明、生成的 public/.content 文件。
+#
+# 提交前逐项确认：
+# 1. 所有 __PLACEHOLDER__ 已替换，不支持的选配块已删除。
+# 2. 所有新增 variant 的 precision/vram/supported_hardware 完整，量化 label、
+#    内部 precision、checkpoint 和 runtime quantization 映射一致。
+# 3. 所有省略字段的默认值确实符合目标模型，而不是因为“可以不写”就忽略。
+# 4. 所有 override 都位于正确层级，没有 scalar→map promotion 或跨品牌修改。
+# 5. Ascend PD 的两个 select、拓扑、remove_args、镜像、source 和全部节点
+#    命令均经过严格渲染与实际环境验证。
