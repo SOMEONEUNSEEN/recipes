@@ -440,14 +440,27 @@ Top-level keys, in this order:
 ### Ascend PD presets
 
 Ascend uses the same Prefill/Decode pools and node commands as other PD routers.
-**Ascend Router** and **Mooncake (Ascend)** appear only on Ascend hardware under
-PD disaggregation. Each remains disabled unless the active model preset (including
-its selected point) explicitly declares the corresponding choice:
-`select.pd_router: ascend` or `select.pd_connector: mooncake_ascend`.
-The preset must match the hardware and variant;
-Baseline or an unrelated preset does not opt in, and URL/API parameters cannot
-bypass this requirement. Select the matching preset in the Presets tab to apply
-its configuration. An overlay can add an opt-in preset such as this
+The `ascend` router and `mooncake_ascend` connector entries in
+`strategies/pd_cluster.yaml` set `requires_preset: true` and
+`hide_on_unsupported_hardware: true`. These are catalog policies, not recipe
+fields: the first requires the active model preset (including its selected
+point) to declare the corresponding `select.pd_router` / `select.pd_connector`
+key, and the second hides the option when the entry's `brands` excludes the
+current hardware. Both default to `false`; hiding only controls presentation
+and never replaces synthesis-time hardware or admission checks. On supported
+hardware, a missing declaration leaves the option visible but disabled.
+
+The preset must match the hardware, strategy and variant. Baseline or an
+unrelated preset does not opt in, and URL/API parameters cannot bypass this
+requirement. A point inherits any `select` field it omits and replaces fields it
+sets; another point's declaration never grants the current point. An invalid or
+unmatched preset/point key follows the normal default-preset and default/first-point
+fallback before this check. Router and connector declarations are independent,
+and a router-only preset keeps the ordinary connector fallback. A catalog
+connector cannot combine `requires_preset: true` with `default: true` (which
+would bypass admission), but a recipe preset may still be `default: true` and
+grant its own declared options. Select the matching preset in the Presets tab to
+apply its configuration. An overlay can add an opt-in preset such as this
 illustrative MoE topology on eight-device nodes (supply the qualified variant,
 runtime image and verification source for the actual model):
 
