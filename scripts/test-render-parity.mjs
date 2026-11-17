@@ -70,6 +70,92 @@ test("Ascend PD URL overrides cannot bypass preset declarations or misreport the
     ascendPdPools(), null, "ascend_pd", undefined, true), /PD decode:.*--kv-transfer-config/);
 });
 
+test("PD policy URLs honor hardware scope, default presets and compatible explicit picks", () => {
+  const unsupported = ascendPdRecipe();
+  unsupported.variants.default.supported_hardware = ["ascend_950dt", "h200"];
+  const denied = resolveSelection(unsupported, new URLSearchParams({
+    hardware: "h200", strategy: "pd_cluster", preset: "ascend_pd", features: "none",
+    pd_router: "ascend", pd_connector: "mooncake_ascend",
+  }), strategies, taxonomy);
+  assert.equal(denied.selection.hardware, "h200");
+  assert.equal(denied.rendering.pd_router, "vllm");
+  assert.equal(denied.rendering.pd_connector, "nixl");
+  for (const param of ["pd_router", "pd_connector"]) {
+    const adjustment = denied.selection.adjusted.find((a) => a.param === param);
+    assert.ok(adjustment, param);
+    assert.match(adjustment.reason, /Huawei hardware/);
+  }
+
+  const fixture = ascendPdRecipe();
+  fixture.presets.ascend_pd.default = true;
+  for (const preset of [null, "not-a-preset"]) {
+    const allowed = resolveSelection(fixture, new URLSearchParams({
+      hardware: "ascend_950dt", strategy: "pd_cluster", features: "none",
+      ...(preset ? { preset } : {}), pd_router: "ascend", pd_connector: "mooncake_ascend",
+    }), strategies, taxonomy);
+    assert.equal(allowed.rendering.preset, "ascend_pd");
+    assert.equal(allowed.rendering.pd_router, "ascend");
+    assert.equal(allowed.rendering.pd_connector, "mooncake_ascend");
+  }
+  const explicit = resolveSelection(fixture, new URLSearchParams({
+    hardware: "ascend_950dt", strategy: "pd_cluster", preset: "ascend_pd", features: "none",
+    pd_router: "vllm", pd_connector: "nixl",
+  }), strategies, taxonomy);
+  assert.equal(explicit.rendering.pd_router, "vllm");
+  assert.equal(explicit.rendering.pd_connector, "nixl");
+  assert.equal(explicit.selection.adjusted.some((a) => ["pd_router", "pd_connector"].includes(a.param)), false);
+
+  const incompatible = resolveSelection(fixture, new URLSearchParams({
+    hardware: "ascend_950dt", strategy: "pd_cluster", preset: "ascend_pd", features: "none",
+    pd_router: "vllm", pd_connector: "mooncake_ascend",
+  }), strategies, taxonomy);
+  assert.equal(incompatible.rendering.pd_router, "vllm");
+  assert.equal(incompatible.rendering.pd_connector, "nixl");
+  const adjustment = incompatible.selection.adjusted.find((a) => a.param === "pd_connector");
+  assert.ok(adjustment);
+  assert.match(adjustment.reason, /Ascend Router/);
+  const markdown = selectionMarkdown(fixture, incompatible, { strategies, taxonomy, urls: { page: "https://example.org/test/Ascend-PD", json: "https://example.org/test/Ascend-PD.json" } });
+  assert.ok(markdown.includes("requested `pd_connector=mooncake_ascend`"));
+  assert.ok(markdown.includes("rendered `nixl` instead"));
+});
+
+test("non-Ascend catalog policies cannot be bypassed through dynamic JSON selections", () => {
+  const custom = structuredClone(strategies);
+  custom.pd_cluster.dynamo.requires_preset = true;
+  custom.pd_cluster.connectors.mooncake.requires_preset = true;
+  const recipe = {
+    hf_id: "test/Generic-PD",
+    model: { model_id: "test/Generic-PD", architecture: "moe" },
+    variants: { default: { precision: "bf16", vram_minimum_gb: 1 } },
+    compatible_strategies: ["single_node_tp", "multi_node_dep", "pd_cluster"],
+    presets: {
+      router: { label: "Router", hardware: "gb300", strategy: "pd_cluster", select: { pd_router: "dynamo" } },
+      connector: { label: "Connector", hardware: "gb300", strategy: "pd_cluster", select: { pd_connector: "mooncake" } },
+    },
+  };
+  const resolve = (params) => resolveSelection(recipe, new URLSearchParams({
+    hardware: "gb300", strategy: "pd_cluster", features: "none", ...params,
+  }), custom, taxonomy);
+  const routerDenied = resolve({ pd_router: "dynamo" });
+  assert.equal(routerDenied.rendering.pd_router, "vllm");
+  assert.match(routerDenied.selection.adjusted.find((a) => a.param === "pd_router").reason, /model preset.*Dynamo/);
+  const routerAllowed = resolve({ preset: "router", pd_router: "dynamo", pd_connector: "nixl" });
+  assert.equal(routerAllowed.rendering.pd_router, "dynamo");
+  assert.equal(routerAllowed.selection.adjusted.some((a) => a.param === "pd_router"), false);
+
+  const connectorDenied = resolve({ pd_connector: "mooncake" });
+  assert.equal(connectorDenied.rendering.pd_connector, "nixl");
+  assert.match(connectorDenied.selection.adjusted.find((a) => a.param === "pd_connector").reason, /model preset.*Mooncake/);
+  const connectorAllowed = resolve({ preset: "connector", pd_connector: "mooncake" });
+  assert.equal(connectorAllowed.rendering.pd_connector, "mooncake");
+  assert.doesNotThrow(() => renderCommand(recipe, "default", "pd_cluster", "gb300", 1, [], custom, taxonomy,
+    { prefill: { nodes: 1 }, decode: { nodes: 1 } }, null, "connector", undefined, true));
+
+  const wrongBrand = { ...recipe, presets: { router: { ...recipe.presets.router, hardware: "mi355x" } } };
+  assert.throws(() => renderCommand(wrongBrand, "default", "pd_cluster", "mi355x", 1, [], custom, taxonomy,
+    { prefill: { nodes: 1 }, decode: { nodes: 1 } }, null, "router", undefined, true), /Invalid preset router.*NVIDIA hardware/);
+});
+
 test("PD JSON and Markdown contain every node independently of the selected rank", () => {
   const recipe = ascendPdRecipe();
   for (const role of ["prefill", "decode"]) recipe.presets.ascend_pd.roles[role].nodes = 8;

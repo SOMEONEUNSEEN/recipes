@@ -1,4 +1,5 @@
 import { applyPresetArgOps, effectivePreset, toggleOwnedFlags, matchingPresets, presetImage, presetPoints, resolvePresetKey, withPreset } from "./recipe-presets.js";
+import { evaluatePdOption, pdRouterOption } from "./pd-option-policy.js";
 
 /**
  * Core command synthesis: Recipe + Variant + Strategy + Hardware + Features → vllm serve command.
@@ -401,18 +402,6 @@ export function pdConnectorKey(strategy, requested) {
   if (requested && connectors[requested]) return requested;
   const keys = Object.keys(connectors);
   return keys.find((k) => connectors[k]?.default) ?? keys[0] ?? null;
-}
-
-/** Ascend PD is opt-in through the active, hardware/variant-scoped preset. */
-export function ascendPdUnavailableReason(strategy, hwProfile, select, field) {
-  if (strategy?.deploy_type !== "pd_cluster" || !isDynamoSupportedOnHardware(strategy.ascend, hwProfile)) {
-    return "Ascend PD requires Ascend hardware and PD disaggregation.";
-  }
-  const key = field === "pd_router" ? "ascend" : "mooncake_ascend";
-  if (select?.[field] !== key) {
-    return `Select a model preset that explicitly configures ${field === "pd_router" ? "Ascend Router" : "Mooncake (Ascend)"} for this hardware and variant.`;
-  }
-  return null;
 }
 
 /**
@@ -1715,27 +1704,41 @@ function resolveCommandImpl(dcpOut, recipe, variantKey, strategyName, hwProfileI
     : null;
   const kvComposing = !!kvStoreStrat && strategy.deploy_type !== "pd_cluster";
 
-  // PD orchestrator: "dynamo" swaps vllm-router for the strategy YAML's
-  // `dynamo` block — same pools/parallelism, but each role launches through
-  // `python3 -m dynamo.vllm --disaggregation-mode <role>` and dynamo.frontend
-  // fronts them. Any other value (or a strategy without the block) = native.
-  const dynamo = strategy.deploy_type === "pd_cluster" && pdRouter === "dynamo"
-      && isDynamoSupportedOnHardware(strategy.dynamo, hwProfile)
-    ? strategy.dynamo
+  // Every router uses its catalog policy. Executor selection stays explicit;
+  // the policy only decides whether the requested, supported executor is
+  // admitted on this hardware and by the effective preset/point declaration.
+  const isPd = strategy.deploy_type === "pd_cluster";
+  const smgReason = isPd
+    ? smgUnsupportedReason(recipe, strategy, pdNodes, kvOffload, pdTransport, hwProfile, hwProfileId)
     : null;
+  const routerPolicies = Object.fromEntries(["vllm", "dynamo", "smg", "ascend"].map((key) => [key, evaluatePdOption({
+    strategy,
+    option: pdRouterOption(strategy, key),
+    key,
+    field: "pd_router",
+    hardware: hwProfile,
+    effectiveSelect: presetSelect,
+    compatibilityReason: key === "smg" ? smgReason : null,
+  })]));
+  const requestedRouterPolicy = isPd && Object.hasOwn(routerPolicies, pdRouter) ? routerPolicies[pdRouter] : null;
+  const requestedRouterOption = isPd ? pdRouterOption(strategy, pdRouter) : null;
+  let routerUnavailableReason = requestedRouterPolicy
+    && (pdRouter === "smg" || requestedRouterOption?.requires_preset === true)
+    ? requestedRouterPolicy.unavailableReason
+    : null;
+
+  // "dynamo" swaps vllm-router for the strategy YAML's `dynamo` block — same
+  // pools/parallelism, but dynamo.vllm launches each role and dynamo.frontend
+  // fronts them. Any unavailable value falls back to the native router.
+  const dynamo = isPd && pdRouter === "dynamo" && !routerPolicies.dynamo.unavailableReason ? strategy.dynamo : null;
   const parserWarnings = new Set();
   const presetWarnings = new Set();
-  let routerUnavailableReason = strategy.deploy_type === "pd_cluster" && pdRouter === "smg"
-    ? smgUnsupportedReason(recipe, strategy, pdNodes, kvOffload, pdTransport, hwProfile, hwProfileId) : null;
-  let smg = strategy.deploy_type === "pd_cluster" && pdRouter === "smg" && !routerUnavailableReason
-    ? strategy.smg : null;
+  let smg = isPd && pdRouter === "smg" && !routerPolicies.smg.unavailableReason ? strategy.smg : null;
 
   let smgGrpc = !!smg && pdTransport === "grpc";
-  const ascendReason = ascendPdUnavailableReason(strategy, hwProfile, presetSelect, "pd_router");
-  const ascend = pdRouter === "ascend" && !ascendReason ? strategy.ascend : null;
+  const ascend = isPd && pdRouter === "ascend" && !routerPolicies.ascend.unavailableReason ? strategy.ascend : null;
   const routerKey = dynamo ? "dynamo" : smg ? "smg" : ascend ? "ascend" : "vllm";
   const externalDp = strategy[routerKey]?.data_parallel_lb === "external";
-  if (pdRouter === "ascend" && !ascend) routerUnavailableReason = ascendReason;
 
   // One pool topology drives the node command, router endpoints and connector
   // metadata. Presets mount their role TP/PP here, before any of those consume it.
@@ -1766,14 +1769,21 @@ function resolveCommandImpl(dcpOut, recipe, variantKey, strategyName, hwProfileI
     return { nodes, parallelism, tp, pp, dpLocal, dpSize, poolGpus, currentNode, startRank: currentNode * dpLocal };
   };
 
-  // PD KV transfer connector: the pick when this hardware and router can run
-  // it, else the default, with the reason surfaced as for the router.
+  // PD KV transfer connector: catalog admission first, then the existing
+  // hardware/router compatibility check and the ordinary default fallback.
   let pdConnectorSel = strategy.deploy_type === "pd_cluster" ? pdConnectorKey(strategy, pdConnectorPick) : null;
   let pdConnectorUnavailable = null;
   if (pdConnectorSel && pdConnectorPick && pdConnectorSel === pdConnectorPick) {
-    pdConnectorUnavailable = (pdConnectorSel === "mooncake_ascend"
-      && ascendPdUnavailableReason(strategy, hwProfile, presetSelect, "pd_connector"))
-      || pdConnectorUnavailableReason(strategy.connectors[pdConnectorSel], hwProfile, routerKey);
+    const connector = strategy.connectors[pdConnectorSel];
+    pdConnectorUnavailable = evaluatePdOption({
+      strategy,
+      option: connector,
+      key: pdConnectorSel,
+      field: "pd_connector",
+      hardware: hwProfile,
+      effectiveSelect: presetSelect,
+      compatibilityReason: pdConnectorUnavailableReason(connector, hwProfile, routerKey),
+    }).unavailableReason;
     if (pdConnectorUnavailable) pdConnectorSel = pdConnectorKey(strategy);
   }
   const pdConnector = pdConnectorSel ? strategy.connectors[pdConnectorSel] : null;

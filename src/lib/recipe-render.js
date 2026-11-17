@@ -6,6 +6,7 @@
 import { BASELINE, effectivePreset, presetPoints, presetSelect, resolvePresetKey, withPreset } from "./recipe-presets.js";
 import { ADVANCED_OPTIONS } from "./advanced-options.js";
 import { SELECTION_PARAMS } from "./selection-params.js";
+import { evaluatePdOption, pdRouterOption } from "./pd-option-policy.js";
 
 export { SELECTION_PARAMS };
 import { resolveOmniTasks, resolveOmniTaskForHardware } from "./omni-tasks.js";
@@ -41,6 +42,7 @@ import {
   pdRoleNodes,
   pdRoleValue,
   pdRoleParallelism,
+  pdConnectorUnavailableReason,
   resolveCommand,
   computeDockerMeta,
   buildDockerRun,
@@ -252,11 +254,16 @@ export function renderCommand(recipe, variantKey, strategy, hwId, nodeCount, fea
   }
   if (!result) return null;
   if (result.frontendRequired) applied.frontend = result.frontendRequired;
-  // A URL cannot opt into Ascend PD without the active recipe declaration.
-  if (applied.pdRouter === "ascend") applied.pdRouter = result.pdRouter ?? "vllm";
-  if (applied.pdConnector === "mooncake_ascend") applied.pdConnector = result.kvConnector?.selected ?? null;
+  // A linked URL can override a preset's default pick, but not a catalog
+  // entry's preset requirement: publish the selection synthesis actually used.
+  if (pdRouterOption(strategies[strategy], applied.pdRouter)?.requires_preset === true) {
+    applied.pdRouter = result.pdRouter ?? "vllm";
+  }
+  if (strategies[strategy]?.connectors?.[applied.pdConnector]?.requires_preset === true) {
+    applied.pdConnector = result.kvConnector?.selected ?? null;
+  }
   if (opts.out) Object.assign(opts.out, applied);
-  if (strict && sel.pd_router === "ascend" && result.routerUnavailableReason) {
+  if (strict && pdRouterOption(strategies[strategy], sel.pd_router)?.requires_preset === true && result.routerUnavailableReason) {
     throw new Error(`Invalid preset ${presetPick}${pointPick ? ` at point ${pointPick}` : ""} in ${recipe.hf_id} (${hwId} / ${strategy}): ${result.routerUnavailableReason}`);
   }
   // A preset that names its KV transfer connector must get it.
@@ -801,8 +808,28 @@ export function resolveSelection(recipe, query, strategies, taxonomy) {
     },
   );
   note("frontend", get("frontend"), applied.frontend ?? frontend, "not supported by this recipe or variant");
-  if (get("pd_router") === "ascend") note("pd_router", "ascend", applied.pdRouter, "requires an active Ascend PD preset for this hardware and variant");
-  if (get("pd_connector") === "mooncake_ascend") note("pd_connector", "mooncake_ascend", applied.pdConnector, "requires an active Ascend PD preset and compatible router");
+  const requestedPdRouter = get("pd_router");
+  const requestedPdConnector = get("pd_connector");
+  const routerOption = pdRouterOption(strategies[strategy], requestedPdRouter);
+  const connectorOption = strategies[strategy]?.connectors?.[requestedPdConnector];
+  if (routerOption?.requires_preset === true || connectorOption?.requires_preset === true) {
+    const effectiveSelect = presetSelect(recipe, resolvePresetKey(recipe, hwId, strategy, presetPick, variantKey), pointPick);
+    if (routerOption?.requires_preset === true) {
+      const policy = evaluatePdOption({
+        strategy: strategies[strategy], option: routerOption, key: requestedPdRouter, field: "pd_router",
+        hardware: hwProfile, effectiveSelect,
+      });
+      note("pd_router", requestedPdRouter, applied.pdRouter, policy.unavailableReason || "not available for this selection");
+    }
+    if (connectorOption?.requires_preset === true) {
+      const policy = evaluatePdOption({
+        strategy: strategies[strategy], option: connectorOption, key: requestedPdConnector, field: "pd_connector",
+        hardware: hwProfile, effectiveSelect,
+        compatibilityReason: pdConnectorUnavailableReason(connectorOption, hwProfile, applied.pdRouter || "vllm"),
+      });
+      note("pd_connector", requestedPdConnector, applied.pdConnector, policy.unavailableReason || "not available for this selection");
+    }
+  }
   note("features", get("features"), (applied.features ?? features).join(",") || "none", "not fully supported by this recipe or variant");
   return {
     omni: false,
