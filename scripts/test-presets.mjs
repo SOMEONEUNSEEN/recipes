@@ -272,32 +272,6 @@ test("pd_cluster points change role args, topology and role JSON edits", () => {
   assert.equal(validate(authored), false);
 });
 
-test("default preset and point fallback drive PD option admission", () => {
-  const fixture = ascendPdRecipe();
-  fixture.presets.ascend_pd.default = true;
-  assert.deepEqual(validatePresets(fixture, taxonomy, fixture.compatible_strategies, [], strategies.pd_cluster.connectors), [],
-    "a recipe preset's default flag is not the forbidden catalog connector default");
-  const run = (preset, point) => resolveCommand(fixture, "default", "pd_cluster", "ascend_950dt", [], strategies, taxonomy,
-    [], 1, ascendPdPools(), {}, null, null, "python", "ascend", "http", null, preset, point, "mooncake_ascend");
-  for (const preset of [undefined, "not-a-preset"]) {
-    const allowed = run(preset);
-    assert.equal(allowed.preset.selected, "ascend_pd");
-    assert.equal(allowed.pdRouter, "ascend");
-    assert.equal(allowed.kvConnector.selected, "mooncake_ascend");
-  }
-  const baseline = run(BASELINE);
-  assert.equal(baseline.pdRouter, "vllm");
-  assert.equal(baseline.kvConnector.selected, "nixl");
-
-  delete fixture.presets.ascend_pd.select.pd_connector;
-  fixture.presets.ascend_pd.points = {
-    qualified: { default: true, select: { pd_connector: "mooncake_ascend" } },
-    routerOnly: {},
-  };
-  assert.equal(run(undefined, "not-a-point").kvConnector.selected, "mooncake_ascend", "an invalid point uses the default point");
-  assert.equal(run(undefined, "routerOnly").kvConnector.selected, "nixl", "another point's declaration is not borrowed");
-});
-
 test("a point's image fields layer over the preset's", () => {
   const p = { image: { vllm: "img:1", dynamo: "d1" }, points: { a: { label: "a", image: { dynamo: "d2" } }, b: { label: "b", image: "img:2" } } };
   assert.deepEqual(effectivePreset(p, "a").image, { vllm: "img:1", dynamo: "d2" });

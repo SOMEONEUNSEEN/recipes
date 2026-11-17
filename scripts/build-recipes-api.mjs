@@ -60,7 +60,6 @@ import { contentChannel, contentDir, loadProvenance } from "../src/lib/content-r
 import { buildVariantRendering, defaultFeaturesFor, pickPdNodes, renderCommand, synthesizeInstall } from "../src/lib/recipe-render.js";
 import { assembleChannel } from "./assemble-content.mjs";
 import { loadOverrides } from "./lib/content-sources.mjs";
-import { validatePdOptionPolicy } from "./lib/validate-pd-option-policy.mjs";
 
 const ROOT = process.cwd();
 // RECIPES_PUBLIC_DIR redirects the output (validate-source.mjs builds into a
@@ -370,8 +369,6 @@ const strategiesDir = path.join(CONTENT, "strategies");
 const strategies = {};
 for (const file of fs.readdirSync(strategiesDir).filter((f) => f.endsWith(".yaml"))) {
   const s = normalizeDates(readYaml(path.join(strategiesDir, file)));
-  const policyErrors = validatePdOptionPolicy(s);
-  if (policyErrors.length) throw new Error(`Invalid PD option policy in strategies/${file}:\n  ${policyErrors.join("\n  ")}`);
   strategies[s.name] = s;
   writeJson(`strategies/${s.name}.json`, s);
 }

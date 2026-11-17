@@ -7,8 +7,6 @@ import { buildDockerArgv, buildDockerRun, computeDockerMeta, pdConnectorKey, pdC
 import { applyPresetArgOps, validatePresets } from "../src/lib/recipe-presets.js";
 import { renderCommand } from "../src/lib/recipe-render.js";
 import { contentDir } from "../src/lib/content-root.js";
-import { evaluatePdOption, pdRouterOption } from "../src/lib/pd-option-policy.js";
-import { validatePdOptionPolicy } from "./lib/validate-pd-option-policy.mjs";
 import { ascendPdPools, ascendPdRecipe } from "./fixtures/ascend-pd.mjs";
 
 // Recipes live in their source repos; read the assembled tree (run
@@ -44,92 +42,6 @@ test("the default connector is the one marked default, else the first", () => {
     assert.equal(pdConnectorUnavailableReason(pd.connectors[r.kvConnector.selected],
       taxonomy.hardware_profiles[hw], r.pdRouter), null, hw);
   }
-});
-
-test("PD option policy separates visibility, scope and compatibility", () => {
-  const evaluate = (overrides = {}) => evaluatePdOption({
-    strategy: { deploy_type: "pd_cluster" },
-    option: { display_name: "Qualified option", brands: ["Huawei"], requires_preset: true },
-    key: "qualified",
-    field: "pd_connector",
-    hardware: { brand: "Huawei" },
-    effectiveSelect: { pd_connector: "qualified" },
-    ...overrides,
-  });
-  assert.deepEqual(evaluate(), { visible: true, scopeReason: null, unavailableReason: null });
-  assert.deepEqual(evaluate({ compatibilityReason: "incompatible router" }), {
-    visible: true, scopeReason: null, unavailableReason: "incompatible router",
-  });
-  assert.equal(evaluate({ strategy: { deploy_type: "single_node" } }).visible, false);
-  assert.match(evaluate({ strategy: { deploy_type: "single_node" } }).scopeReason, /PD disaggregation/);
-  assert.equal(evaluate({ option: null }).visible, false);
-  assert.match(evaluate({ option: null }).unavailableReason, /not configured/);
-
-  const unsupported = evaluate({ hardware: { brand: "NVIDIA" } });
-  assert.equal(unsupported.visible, true, "unsupported brands remain visible unless the entry opts into hiding");
-  assert.match(unsupported.scopeReason, /Huawei hardware/);
-  const hidden = evaluate({ hardware: { brand: "NVIDIA" }, option: {
-    display_name: "Qualified option", brands: ["Huawei"], requires_preset: true, hide_on_unsupported_hardware: true,
-  } });
-  assert.equal(hidden.visible, false);
-  assert.match(hidden.unavailableReason, /Huawei hardware/);
-
-  const missing = evaluate({ effectiveSelect: { pd_connector: "another" }, compatibilityReason: "incompatible router" });
-  assert.equal(missing.visible, true);
-  assert.match(missing.scopeReason, /model preset.*Qualified option/);
-  assert.equal(missing.unavailableReason, missing.scopeReason, "scope failures take precedence over compatibility");
-  assert.equal(evaluate({ option: { display_name: "Ungated", brands: ["Huawei"] }, effectiveSelect: null }).unavailableReason, null);
-  assert.equal(pdRouterOption({ router: { policy: "round_robin" } }, "vllm").policy, "round_robin");
-  assert.equal(pdRouterOption({ dynamo: { display_name: "Dynamo" } }, "dynamo").display_name, "Dynamo");
-});
-
-test("production catalog opts only Ascend into hiding and preset admission", () => {
-  const pd = strategies.pd_cluster;
-  for (const option of [pd.ascend, pd.connectors.mooncake_ascend]) {
-    assert.equal(option.requires_preset, true);
-    assert.equal(option.hide_on_unsupported_hardware, true);
-  }
-  for (const option of [pd.dynamo, pd.smg, pd.connectors.nixl, pd.connectors.mooncake, pd.connectors.moriio]) {
-    assert.equal(option.requires_preset, undefined);
-    assert.equal(option.hide_on_unsupported_hardware, undefined);
-  }
-  const legacy = evaluatePdOption({ strategy: pd, option: pd.connectors.mooncake, key: "mooncake", field: "pd_connector",
-    hardware: { brand: "AMD" }, effectiveSelect: null });
-  assert.equal(legacy.visible, true, "ordinary Mooncake keeps its disabled pill on unsupported hardware");
-  assert.match(legacy.unavailableReason, /NVIDIA/);
-  const ascendHidden = evaluatePdOption({ strategy: pd, option: pd.ascend, key: "ascend", field: "pd_router",
-    hardware: { brand: "NVIDIA" }, effectiveSelect: { pd_router: "ascend" } });
-  assert.equal(ascendHidden.visible, false);
-  assert.match(ascendHidden.unavailableReason, /Huawei/);
-});
-
-test("catalog policy validation rejects bad types, locations, brands and gated defaults", () => {
-  assert.deepEqual(validatePdOptionPolicy(strategies.pd_cluster), []);
-  const clone = () => structuredClone(strategies.pd_cluster);
-  for (const [field, value] of [["requires_preset", "true"], ["hide_on_unsupported_hardware", 1]]) {
-    const pd = clone();
-    pd.connectors.mooncake_ascend[field] = value;
-    assert.ok(validatePdOptionPolicy(pd).some((e) => e === `connectors.mooncake_ascend.${field}: expected boolean`));
-  }
-  for (const brands of [undefined, [], [""], [42]]) {
-    const pd = clone();
-    pd.connectors.other = { requires_preset: false, hide_on_unsupported_hardware: true, ...(brands === undefined ? {} : { brands }) };
-    assert.ok(validatePdOptionPolicy(pd).some((e) => /connectors\.other\.hide_on_unsupported_hardware: requires/.test(e)));
-  }
-  const nested = clone();
-  nested.prefill.requires_preset = true;
-  assert.ok(validatePdOptionPolicy(nested).some((e) => /prefill\.requires_preset: only a pd_cluster router or connector/.test(e)));
-  const nonPd = { name: "single", deploy_type: "single_node", dynamo: { requires_preset: true }, connectors: { other: { hide_on_unsupported_hardware: false } } };
-  const locationErrors = validatePdOptionPolicy(nonPd);
-  assert.ok(locationErrors.some((e) => /dynamo\.requires_preset: only/.test(e)));
-  assert.ok(locationErrors.some((e) => /connectors\.other\.hide_on_unsupported_hardware: only/.test(e)));
-  const gatedDefault = clone();
-  gatedDefault.connectors.nixl.requires_preset = true;
-  assert.ok(validatePdOptionPolicy(gatedDefault).some((e) => /connectors\.nixl\.requires_preset: a gated connector cannot also be the catalog default/.test(e)));
-  const genericRouter = clone();
-  genericRouter.dynamo.requires_preset = true;
-  genericRouter.dynamo.hide_on_unsupported_hardware = false;
-  assert.deepEqual(validatePdOptionPolicy(genericRouter), [], "an existing non-Ascend router can use the same policy");
 });
 
 test("each role renders its connector's config and env", () => {
@@ -419,53 +331,12 @@ test("Ascend PD uses the current point's inherited declarations, not another poi
     overridden: { select: { pd_router: "vllm", pd_connector: "mooncake_ascend" } },
   };
   for (const [point, router, connector] of [[undefined, "ascend", "mooncake_ascend"], ["qualified", "ascend", "mooncake_ascend"],
-    ["invalid", "ascend", "mooncake_ascend"], ["unconfigured", "ascend", "nixl"], ["overridden", "vllm", "nixl"]]) {
+    ["unconfigured", "ascend", "nixl"], ["overridden", "vllm", "nixl"]]) {
     const r = resolveCommand(fixture, "default", "pd_cluster", "ascend_950dt", [], strategies, taxonomy, [], 1,
       ascendPdPools(), {}, null, null, "python", "ascend", "http", null, "ascend_pd", point, "mooncake_ascend");
     assert.equal(r.pdRouter, router, point);
     assert.equal(r.kvConnector.selected, connector, point);
   }
-});
-
-test("a synthetic non-Ascend connector uses the same preset policy", () => {
-  const custom = structuredClone(strategies);
-  custom.pd_cluster.connectors.synthetic = {
-    ...custom.pd_cluster.connectors.mooncake_ascend,
-    display_name: "Synthetic connector",
-    requires_preset: true,
-  };
-  const fixture = ascendPdRecipe();
-  for (const role of ["prefill", "decode"]) delete fixture.presets.ascend_pd.roles[role].json_args["--kv-transfer-config"];
-  const run = () => resolveCommand(fixture, "default", "pd_cluster", "ascend_950dt", [], custom, taxonomy, [], 1,
-    ascendPdPools(), {}, null, null, "python", "ascend", "http", null, "ascend_pd", undefined, "synthetic");
-  const denied = run();
-  assert.equal(denied.kvConnector.selected, "nixl");
-  assert.match(denied.kvConnector.unavailableReason, /model preset.*Synthetic connector/);
-  fixture.presets.ascend_pd.select.pd_connector = "synthetic";
-  const allowed = run();
-  assert.equal(allowed.kvConnector.selected, "synthetic");
-  assert.equal(allowed.kvConnector.unavailableReason, null);
-  assert.equal(kvCfg(allowed, "prefill").kv_connector, "MooncakeConnectorV2");
-});
-
-test("an existing non-Ascend router executes the same preset policy", () => {
-  const custom = structuredClone(strategies);
-  custom.pd_cluster.dynamo.requires_preset = true;
-  const gatedRecipe = { ...recipe, presets: { lane: {
-    label: "Dynamo lane", hardware: "gb300", strategy: "pd_cluster", select: { pd_router: "dynamo" },
-  } } };
-  const run = (preset) => resolveCommand(gatedRecipe, "default", "pd_cluster", "gb300", [], custom, taxonomy, [], 1,
-    pools, {}, null, null, undefined, "dynamo", "http", null, preset, undefined, "nixl");
-  for (const preset of [undefined, "baseline"]) {
-    const denied = run(preset);
-    assert.equal(denied.pdRouter, "vllm");
-    assert.match(denied.routerUnavailableReason, /model preset.*Dynamo/);
-    assert.equal(denied.kvConnector.selected, "nixl");
-  }
-  const allowed = run("lane");
-  assert.equal(allowed.pdRouter, "dynamo");
-  assert.equal(allowed.routerUnavailableReason, undefined);
-  assert.match(allowed.prefill.command, /dynamo\.vllm/);
 });
 
 test("TP/TEP derives its width from the whole pool as PD grows from four to eight nodes", () => {

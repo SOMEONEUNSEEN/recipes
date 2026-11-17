@@ -6,10 +6,9 @@ import { track } from "@vercel/analytics";
 import { useSearchParams, useRouter, usePathname } from "next/navigation";
 import { Copy, Check, Terminal, Gauge, Sparkles, ChevronDown, Package, Info, Zap, Globe, Wrench, Brain, ExternalLink } from "lucide-react";
 import { HuggingFaceIcon } from "@/components/icons/PlatformLogos";
-import { maxVersion, resolveInstall, isFeatureAllowedForVariant, restoreVariantDefaults, FEATURE_MUTEX, hardwareInstall, hwPipOverride, multiNodeFloor, resolveCommand, recommendStrategy, isPrecisionCompatible, isHardwareSupported, isVariantHardwareSupported, fitsSingleNode, isHardwareScalable, isKvStoreBrandSupported, variantRunsOnHardware, variantVramMinimumGb, pickFittingVariant, pickDefaultHardware, resolveSingleNodeTp, lastIntFlag, computeDockerMeta, cu129DockerImage, LAST_CU129_RELEASE, buildDockerRun, resolveOmniCommand, pdPoolModes, pdRoleNodes, pdRoleParallelism, defaultModeFor, isModeSupported, isModeAllowedForVariant, resolveModeKey, isFeatureAllowedForStrategy, isFeatureSupportedOnHardware, isKvOffloadAllowedForStrategy, isKvOffloadSupportedForRecipe, isKvOffloadBrandSupported, isKvOffloadInstallable, isPipInstallAvailable, kvOffloadInstallSteps, resolveKvOffloadOption, strategyAllowsKvOffload, MAX_NODES, nodesForStrategy, isStrategyReachable, isStrategySupportedOnHardware, effectiveCompatibleStrategies, needsMultiNode, multiNodeUnavailable, resolveFrontend, isFrontendSupported, smgUnsupportedReason, pdConnectorUnavailableReason } from "@/lib/command-synthesis";
+import { maxVersion, resolveInstall, isFeatureAllowedForVariant, restoreVariantDefaults, FEATURE_MUTEX, hardwareInstall, hwPipOverride, multiNodeFloor, resolveCommand, recommendStrategy, isPrecisionCompatible, isHardwareSupported, isVariantHardwareSupported, fitsSingleNode, isHardwareScalable, isKvStoreBrandSupported, variantRunsOnHardware, variantVramMinimumGb, pickFittingVariant, pickDefaultHardware, resolveSingleNodeTp, lastIntFlag, computeDockerMeta, cu129DockerImage, LAST_CU129_RELEASE, buildDockerRun, resolveOmniCommand, pdPoolModes, pdRoleNodes, pdRoleParallelism, defaultModeFor, isModeSupported, isModeAllowedForVariant, resolveModeKey, isFeatureAllowedForStrategy, isFeatureSupportedOnHardware, isKvOffloadAllowedForStrategy, isKvOffloadSupportedForRecipe, isKvOffloadBrandSupported, isKvOffloadInstallable, isPipInstallAvailable, kvOffloadInstallSteps, resolveKvOffloadOption, strategyAllowsKvOffload, MAX_NODES, nodesForStrategy, isStrategyReachable, isStrategySupportedOnHardware, effectiveCompatibleStrategies, needsMultiNode, multiNodeUnavailable, resolveFrontend, isFrontendSupported, isDynamoSupportedOnHardware, smgUnsupportedReason, pdConnectorUnavailableReason, pdPresetUnavailableReason, pdRouterOption } from "@/lib/command-synthesis";
 import { resolveOmniTasks, resolveOmniTaskForHardware } from "@/lib/omni-tasks";
 import { presetPoints, presetSelect, resolvePresetKey, withPreset } from "@/lib/recipe-presets";
-import { evaluatePdOption, pdRouterOption } from "@/lib/pd-option-policy";
 import ShellCode from "@/components/recipes/ShellCode";
 import { publishSelection, onPresetRequest } from "@/lib/selection-store";
 import { holdInPlace } from "@/lib/hold-in-place";
@@ -1306,8 +1305,8 @@ export function CommandBuilder({ recipe, strategies, taxonomy, contextNotes = []
       q.set("decode_mode", effPdDecodePar);
       if (pdPrefillRank > 0) q.set("prefill_rank", String(pdPrefillRank));
       if (pdDecodeRank > 0) q.set("decode_rank", String(pdDecodeRank));
-      q.set("pd_router", pdRouterOption(strategies.pd_cluster, pdRouter)?.requires_preset === true ? result.pdRouter || "vllm" : pdRouter);
-      if (pdConnector) q.set("pd_connector", strategies.pd_cluster?.connectors?.[pdConnector]?.requires_preset === true ? result.kvConnector?.selected || "" : pdConnector);
+      q.set("pd_router", pdRouterOption(strategies.pd_cluster, pdRouter)?.requires_preset ? result.pdRouter || "vllm" : pdRouter);
+      if (pdConnector) q.set("pd_connector", strategies.pd_cluster?.connectors?.[pdConnector]?.requires_preset ? result.kvConnector?.selected || "" : pdConnector);
       if (pdTransport !== "http") q.set("pd_transport", pdTransport);
     } else {
       q.set("nodes", String(nodeCount));
@@ -1653,26 +1652,18 @@ export function CommandBuilder({ recipe, strategies, taxonomy, contextNotes = []
 
   // Switching a pool's parallelism changes what the rank/node index means
   // (DEP start-rank vs TP node-rank), so reset that pool's rank to 0.
+  // Dynamo is brand-gated (strategy YAML `dynamo.brands`); on other hardware
+  // the row shows vLLM Router active and synthesis ignores the pick.
   const pdCatalog = strategies.pd_cluster || {};
+  const dynamoOk = isDynamoSupportedOnHardware(pdCatalog.dynamo, hwProfile);
+  const pdOptionVisible = (option) => !option?.hide_on_unsupported_hardware || isDynamoSupportedOnHardware(option, hwProfile);
+  const ascendVisible = pdOptionVisible(pdCatalog.ascend);
   const pdSelect = presetSelect(recipe, resolvePresetKey(recipe, hwId, activeServingStrategy, presetPick, variant), pointPick);
-  const routerPolicy = (key, compatibilityReason = null) => evaluatePdOption({
-    strategy: strategies[activeServingStrategy],
-    option: pdRouterOption(pdCatalog, key),
-    key,
-    field: "pd_router",
-    hardware: hwProfile,
-    effectiveSelect: pdSelect,
-    compatibilityReason,
-  });
+  const pdPresetReason = (option, key, field) => pdPresetUnavailableReason(strategies[activeServingStrategy], option, hwProfile, pdSelect, key, field);
+  const ascendReason = pdPresetReason(pdCatalog.ascend, "ascend", "pd_router");
   const smgReason = smgUnsupportedReason(recipe, pdCatalog, {
     prefill: { parallelism: effPdPrefillPar }, decode: { parallelism: effPdDecodePar },
   }, activeKvOffload);
-  const pdRouterPolicies = {
-    vllm: routerPolicy("vllm"),
-    dynamo: routerPolicy("dynamo"),
-    smg: routerPolicy("smg", smgReason),
-    ascend: routerPolicy("ascend"),
-  };
   const effPdRouter = result.pdRouter || (result.orchestrator === "smg" ? "smg" : result.orchestrator === "dynamo" ? "dynamo" : "vllm");
   const isSmgGrpc = result.orchestrator === "smg" && result.transport === "grpc";
   const selectPdRouter = (value) => {
@@ -1680,42 +1671,33 @@ export function CommandBuilder({ recipe, strategies, taxonomy, contextNotes = []
     syncUrl({ pd_router: value === "vllm" ? "" : value });
   };
   // PD Connector row: the connector synthesis actually rendered (a pick this
-  // hardware, preset or router can't run falls back to the default).
+  // hardware or router can't run falls back to the default).
   const pdConnectors = pdCatalog.connectors || {};
   const effPdConnector = result.kvConnector?.selected ?? null;
-  const pdConnectorPolicy = (key) => evaluatePdOption({
-    strategy: strategies[activeServingStrategy],
-    option: pdConnectors[key],
-    key,
-    field: "pd_connector",
-    hardware: hwProfile,
-    effectiveSelect: pdSelect,
-    compatibilityReason: pdConnectorUnavailableReason(pdConnectors[key], hwProfile, effPdRouter),
-  });
+  const pdConnectorReason = (key) => pdPresetReason(pdConnectors[key], key, "pd_connector")
+    || pdConnectorUnavailableReason(pdConnectors[key], hwProfile, effPdRouter);
   const selectPdConnector = (key) => {
     const isDefault = pdConnectors[key]?.default;
     setPdConnector(isDefault ? null : key);
     syncUrl({ pd_connector: isDefault ? "" : key });
   };
 
-  // Only scope failures clear state. A compatibility-only failure keeps its
-  // pick so switching back to a compatible router restores the old behavior.
-  const gatedPdRouterReason = pdRouterOption(pdCatalog, pdRouter)?.requires_preset === true
-    ? pdRouterPolicies[pdRouter]?.scopeReason : null;
-  const gatedPdConnectorReason = pdConnectors[pdConnector]?.requires_preset === true
-    ? pdConnectorPolicy(pdConnector).scopeReason : null;
+  // Synthesis enforces preset admission synchronously; clear stale gated state
+  // and URLs after the render. Compatibility-only failures keep their pick.
+  const pdRouterPresetReason = pdPresetReason(pdRouterOption(pdCatalog, pdRouter), pdRouter, "pd_router");
+  const pdConnectorPresetReason = pdPresetReason(pdConnectors[pdConnector], pdConnector, "pd_connector");
   useEffect(() => {
     const updates = {};
-    if (gatedPdRouterReason && pdRouter !== "vllm") {
+    if (pdRouterPresetReason) {
       setPdRouter("vllm");
       updates.pd_router = "";
     }
-    if (gatedPdConnectorReason) {
+    if (pdConnectorPresetReason) {
       setPdConnector(null);
       updates.pd_connector = "";
     }
     if (Object.keys(updates).length) syncUrl(updates);
-  }, [gatedPdRouterReason, gatedPdConnectorReason, pdRouter, pdConnector, syncUrl]);
+  }, [pdRouterPresetReason, pdConnectorPresetReason, syncUrl]);
 
   const setPdPar = (role, mode) => {
     if (!pdModes.includes(mode)) return;
@@ -3041,39 +3023,40 @@ export function CommandBuilder({ recipe, strategies, taxonomy, contextNotes = []
           {activeServingStrategy === "pd_cluster" && (strategies.pd_cluster?.dynamo || strategies.pd_cluster?.smg || strategies.pd_cluster?.ascend) && (
             <ConfigRow label="PD Router" nested>
               <PillGroup>
-                {pdRouterPolicies.vllm.visible && <Pill
+                <Pill
                   active={effPdRouter === "vllm"}
                   pressed={effPdRouter === "vllm"}
-                  disabled={!!pdRouterPolicies.vllm.unavailableReason}
-                  onClick={() => !pdRouterPolicies.vllm.unavailableReason && selectPdRouter("vllm")}
-                  title={pdRouterPolicies.vllm.unavailableReason || "Native vllm-router in PD mode — prefill/decode workers are plain `vllm serve` processes on fixed HTTP ports."}
+                  onClick={() => selectPdRouter("vllm")}
+                  title="Native vllm-router in PD mode — prefill/decode workers are plain `vllm serve` processes on fixed HTTP ports."
                 >
                   <span className="font-semibold">vLLM Router</span>
-                </Pill>}
-                {pdRouterPolicies.dynamo.visible && strategies.pd_cluster.dynamo && <Pill
+                </Pill>
+                {strategies.pd_cluster.dynamo && <Pill
                   active={effPdRouter === "dynamo"}
                   pressed={effPdRouter === "dynamo"}
-                  disabled={!!pdRouterPolicies.dynamo.unavailableReason}
-                  onClick={() => !pdRouterPolicies.dynamo.unavailableReason && selectPdRouter("dynamo")}
-                  title={pdRouterPolicies.dynamo.unavailableReason || strategies.pd_cluster.dynamo.description}
+                  disabled={!dynamoOk}
+                  onClick={() => dynamoOk && selectPdRouter("dynamo")}
+                  title={dynamoOk
+                    ? strategies.pd_cluster.dynamo.description
+                    : `Dynamo isn't available on ${hwProfile.display_name || hwId} — it needs ${(strategies.pd_cluster.dynamo.brands || []).join(" / ")} hardware.`}
                 >
                   <span className="font-semibold">{strategies.pd_cluster.dynamo.display_name || "Dynamo"}</span>
                 </Pill>}
-                {pdRouterPolicies.smg.visible && strategies.pd_cluster.smg && <Pill
+                {strategies.pd_cluster.smg && <Pill
                   active={effPdRouter === "smg"}
                   pressed={effPdRouter === "smg"}
-                  disabled={!!pdRouterPolicies.smg.unavailableReason}
-                  onClick={() => !pdRouterPolicies.smg.unavailableReason && selectPdRouter("smg")}
-                  title={pdRouterPolicies.smg.unavailableReason || strategies.pd_cluster.smg.description}
+                  disabled={!!smgReason}
+                  onClick={() => !smgReason && selectPdRouter("smg")}
+                  title={smgReason || strategies.pd_cluster.smg.description}
                 >
                   <span className="font-semibold">SMG</span>
                 </Pill>}
-                {pdRouterPolicies.ascend.visible && strategies.pd_cluster.ascend && <Pill
+                {ascendVisible && strategies.pd_cluster.ascend && <Pill
                   active={effPdRouter === "ascend"}
                   pressed={effPdRouter === "ascend"}
-                  disabled={!!pdRouterPolicies.ascend.unavailableReason}
-                  onClick={() => !pdRouterPolicies.ascend.unavailableReason && selectPdRouter("ascend")}
-                  title={pdRouterPolicies.ascend.unavailableReason || strategies.pd_cluster.ascend.description}
+                  disabled={!!ascendReason}
+                  onClick={() => !ascendReason && selectPdRouter("ascend")}
+                  title={ascendReason || strategies.pd_cluster.ascend.description}
                 >
                   <span className="font-semibold">{strategies.pd_cluster.ascend.display_name || "Ascend Router"}</span>
                 </Pill>}
@@ -3136,8 +3119,8 @@ export function CommandBuilder({ recipe, strategies, taxonomy, contextNotes = []
           {activeServingStrategy === "pd_cluster" && Object.keys(pdConnectors).length > 1 && (
             <ConfigRow label="PD Connector" nested hint="Connector that moves each request's KV cache from the prefill pool to the decode pool. KV Offload tiers below compose with it.">
               <PillGroup>
-                {Object.entries(pdConnectors).filter(([key]) => pdConnectorPolicy(key).visible).map(([key, c]) => {
-                  const reason = pdConnectorPolicy(key).unavailableReason;
+                {Object.entries(pdConnectors).filter(([, c]) => pdOptionVisible(c)).map(([key, c]) => {
+                  const reason = pdConnectorReason(key);
                   return (
                     <Pill key={key} active={effPdConnector === key} pressed={effPdConnector === key} disabled={!!reason}
                       onClick={() => !reason && selectPdConnector(key)} title={reason || c.description}>

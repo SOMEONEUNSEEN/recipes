@@ -46,11 +46,6 @@ decode:
 #   default: true  — rendered when nothing selects another
 #   brands         — hardware brands that run it (absent = all)
 #   routers        — PD routers that speak it (absent = vLLM Router only)
-#   requires_preset — the effective preset/point's select.pd_connector must name
-#                    this key (default false); the catalog owns the requirement,
-#                    while the recipe supplies the hardware/variant-scoped grant
-#   hide_on_unsupported_hardware — hide when brands excludes the current hardware
-#                    instead of showing a disabled pill (default false)
 #   router         — vllm-router's mode: kv_connector (--kv-connector, nixl
 #                    is its default), bootstrap_port (listed after each
 #                    prefill endpoint), discovery_port (workers register via
@@ -150,9 +145,6 @@ parallel_flag: "--tensor-parallel-size"
 router:
   policy: round_robin
 
-# Router entries use the same optional policy fields as connectors. Here the
-# active preset/point must declare select.pd_router: ascend; unsupported brands
-# hide the pill. Neither field changes the executor or its launch topology.
 ascend:
   display_name: "Ascend Router"
   description: "Ascend proxy with a TP/PP head endpoint or one external-DP endpoint per rank."
