@@ -179,6 +179,11 @@ hardware_overrides:
 #   pp           — pipeline stages (default 1; DEP requires pp=1);
 #                  TP/TEP derives TP as pool_devices / pp, which must be integral
 #                  `tp` and `pp` also accept hardware-keyed maps
+#   pcp          — prefill-context parallel width (default 1; DEP prefill only):
+#                  one prefill request spans tp × pcp devices, so
+#                  dp_local = gpu_count / (tp × pcp). Emitted as
+#                  --prefill-context-parallel-size. A PD connector's `tp_size`
+#                  stays TP — PCP does not enter the connector layout.
 #   vllm_args    — extra flags appended to this role's `vllm serve`
 #   env          — extra env vars for this role
 #   parallel_flag — (rare) override the auto-selected flag for parallelism=tp
@@ -191,6 +196,8 @@ strategy_overrides:
       nodes: 1
       parallelism: dep
       tp: 1                                     # DP = nodes × gpus_per_node / tp = 4
+      # pcp: 4                                  # optional, DEP prefill only:
+      #                                         # DP = nodes × gpus_per_node / (tp × pcp)
       env: {}
     decode:
       nodes: 4

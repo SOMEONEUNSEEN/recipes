@@ -1726,20 +1726,27 @@ function resolveCommandImpl(dcpOut, recipe, variantKey, strategyName, hwProfileI
       ?? declaredTpForHardware(strategy[role]?.[key], hwProfile, hwProfileId);
     const poolGpus = nodes === 0 ? Math.floor(gpuCount / 2) : nodes * gpuCount;
     const pp = value("pp") ?? 1;
+    // PCP splits one prefill's sequence across tp × pcp devices of a DEP pool
+    // (vLLM's --prefill-context-parallel-size); it is a prefill-only dimension.
+    const pcp = value("pcp") ?? 1;
     // TP/TEP spans the whole pool; role TP only sizes individual DEP ranks.
     const tp = parallelism === "dep" ? value("tp") ?? 1 : poolGpus / pp;
     const fail = (message) => { throw new RangeError(`PD ${role}: ${message}`); };
-    if (!Number.isInteger(nodes) || nodes < 0 || !Number.isInteger(tp) || tp < 1 || !Number.isInteger(pp) || pp < 1) {
-      fail("nodes, TP and PP must form a positive integer layout (nodes=0 denotes a shared node).");
+    if (!Number.isInteger(nodes) || nodes < 0 || !Number.isInteger(tp) || tp < 1 || !Number.isInteger(pp) || pp < 1
+        || !Number.isInteger(pcp) || pcp < 1) {
+      fail("nodes, TP, PP and PCP must form a positive integer layout (nodes=0 denotes a shared node).");
+    }
+    if (pcp !== 1 && (role !== "prefill" || parallelism !== "dep")) {
+      fail("PCP is only supported on a DEP prefill pool.");
     }
     if (parallelism === "dep") {
-      if (pp !== 1 || tp > gpuCount || gpuCount % tp) fail("DEP requires PP1 and TP that divides the devices per node.");
+      if (pp !== 1 || tp * pcp > gpuCount || gpuCount % (tp * pcp)) fail("DEP requires PP1 and TP × PCP that divides the devices per node.");
       if (externalDp && (nodes < 1 || recipe.model?.architecture === "dense")) fail("external DEP requires a MoE model and dedicated role nodes.");
     }
-    const dpLocal = parallelism === "dep" ? gpuCount / tp : 0;
+    const dpLocal = parallelism === "dep" ? gpuCount / (tp * pcp) : 0;
     const dpSize = parallelism === "dep" ? Math.max(1, nodes) * dpLocal : 1;
     const currentNode = Math.max(0, Math.min(Math.max(1, nodes) - 1, selected.rank ?? 0));
-    return { nodes, parallelism, tp, pp, dpLocal, dpSize, poolGpus, currentNode, startRank: currentNode * dpLocal };
+    return { nodes, parallelism, tp, pcp, pp, dpLocal, dpSize, poolGpus, currentNode, startRank: currentNode * dpLocal };
   };
 
   // PD KV transfer connector: the pick when this hardware and router can run
@@ -1960,6 +1967,7 @@ function resolveCommandImpl(dcpOut, recipe, variantKey, strategyName, hwProfileI
         if (pdRoleValue(recipe, roleKey, "tp", hwProfile, hwProfileId) !== undefined || roleCfg.tp !== undefined) {
           args.push("--tensor-parallel-size", String(meta.tp));
         }
+        if (meta.pcp > 1) args.push("--prefill-context-parallel-size", String(meta.pcp));
         args.push("--data-parallel-size", String(meta.dpSize));
         args.push("--data-parallel-size-local", String(meta.dpLocal));
         // Native external-LB supervises one HTTP server per local rank. With
@@ -2166,7 +2174,7 @@ function resolveCommandImpl(dcpOut, recipe, variantKey, strategyName, hwProfileI
         && (externalDp || pdRoleValue(recipe, roleOverride, "pp", hwProfile, hwProfileId) != null)) {
       // A late CLI override must not invalidate the topology advertised to
       // the connector/router. Set topology through role fields, not raw args.
-      const aliases = { "-tp": "--tensor-parallel-size", "-pp": "--pipeline-parallel-size", "-dp": "--data-parallel-size" };
+      const aliases = { "-tp": "--tensor-parallel-size", "-pp": "--pipeline-parallel-size", "-dp": "--data-parallel-size", "-pcp": "--prefill-context-parallel-size" };
       const flags = new Map(out.flatMap((token, i) => {
         if (typeof token !== "string" || !/^--?\w/.test(token)) return [];
         const [flag, ...value] = token.split("=");
@@ -2176,12 +2184,13 @@ function resolveCommandImpl(dcpOut, recipe, variantKey, strategyName, hwProfileI
       const expected = { "--tensor-parallel-size": meta.tp, "--pipeline-parallel-size": meta.pp };
       if (meta.parallelism === "dep") Object.assign(expected, {
         "--data-parallel-size": meta.dpSize, "--data-parallel-size-local": meta.dpLocal,
+        "--prefill-context-parallel-size": meta.pcp,
         ...(externalDp && meta.dpSize === 1 ? {} : {
           [externalDp && meta.dpLocal === 1 ? "--data-parallel-rank" : "--data-parallel-start-rank"]: meta.startRank,
         }),
       });
       for (const [flag, size] of Object.entries(expected)) {
-        const fallback = flag === "--pipeline-parallel-size" || flag === "--tensor-parallel-size" ? 1 : NaN;
+        const fallback = flag === "--pipeline-parallel-size" || flag === "--tensor-parallel-size" || flag === "--prefill-context-parallel-size" ? 1 : NaN;
         if (Number(flags.get(flag) ?? fallback) !== size) throw new RangeError(`PD ${roleOverride}: ${flag} conflicts with the role topology; use role nodes/pp (and tp for DEP) instead.`);
       }
       if (externalDp && meta.parallelism === "dep") {

@@ -87,6 +87,7 @@ export const OVERLAY_RULES = [
   ["strategy_overrides", "*", "hardware_overrides", "@hw"],
   ["strategy_overrides", "pd_cluster", "*", "tp", "@hw"],
   ["strategy_overrides", "pd_cluster", "*", "pp", "@hw"],
+  ["strategy_overrides", "pd_cluster", "*", "pcp", "@hw"],
   ["features", "*", "hardware_overrides", "@hw"],
   ["features", "*", "modes", "*", "hardware_overrides", "@hw"],
   ["features", "*", "modes", "*", "hardware", "@hw"],

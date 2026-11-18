@@ -116,7 +116,7 @@ function mergeDelta(a = {}, b = {}) {
   if (env) out.env = env;
   if (remove) out.remove_args = remove;
   if (json) out.json_args = json;
-  for (const k of ["nodes", "parallelism", "tp", "pp"]) if (b[k] !== undefined) out[k] = b[k];
+  for (const k of ["nodes", "parallelism", "tp", "pp", "pcp"]) if (b[k] !== undefined) out[k] = b[k];
   return out;
 }
 
@@ -183,7 +183,7 @@ export function withPreset(recipe, key, hwId, strategyName, opts = {}) {
     const r = { ...(so[role] || {}) };
     r.hardware_overrides = { ...(r.hardware_overrides || {}) };
     r.hardware_overrides[hwId] = mountLayer(r.hardware_overrides[hwId], delta);
-    for (const k of ["nodes", "parallelism", "tp", "pp"]) {
+    for (const k of ["nodes", "parallelism", "tp", "pp", "pcp"]) {
       const v = mountKeyed(r[k], hwId, delta?.[k]);
       if (v !== undefined) r[k] = v;
     }
@@ -396,7 +396,10 @@ export function validatePresets(recipe, taxonomy, strategyIds, kvStoreIds = [], 
     checkDelta(p, where);
     checkTopology(p, where);
     checkSelect(p.select, `${where}.select`);
-    for (const [role, d] of Object.entries(p.roles || {})) checkDelta(d, `${where}.roles.${role}`);
+    for (const [role, d] of Object.entries(p.roles || {})) {
+      checkDelta(d, `${where}.roles.${role}`);
+      if (d?.pcp !== undefined && role !== "prefill") errors.push(`${where}.roles.${role}.pcp: only the prefill pool sets pcp`);
+    }
     const points = presetPoints(p);
     if (points.filter((pt) => pt.default).length > 1) errors.push(`${where}.points: more than one default point`);
     for (const pt of points) {
@@ -405,7 +408,10 @@ export function validatePresets(recipe, taxonomy, strategyIds, kvStoreIds = [], 
       checkDelta(pt, at);
       checkTopology(pt, at);
       checkSelect(pt.select, `${at}.select`);
-      for (const [role, d] of Object.entries(pt.roles || {})) checkDelta(d, `${at}.roles.${role}`);
+      for (const [role, d] of Object.entries(pt.roles || {})) {
+        checkDelta(d, `${at}.roles.${role}`);
+        if (d?.pcp !== undefined && role !== "prefill") errors.push(`${at}.roles.${role}.pcp: only the prefill pool sets pcp`);
+      }
     }
   }
   return errors;

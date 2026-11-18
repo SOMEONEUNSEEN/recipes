@@ -75,7 +75,7 @@ test("PD JSON and Markdown contain every node independently of the selected rank
   for (const role of ["prefill", "decode"]) recipe.presets.ascend_pd.roles[role].nodes = 8;
   const pools = (rank) => Object.fromEntries(Object.entries(ascendPdPools(rank)).map(([role, pool]) => [role, { ...pool, nodes: 8 }]));
   const flag = (argv, key) => argv[argv.lastIndexOf(key) + 1];
-  const allowed = new Set(["command", "argv", "env", "nodes", "parallelism", "tp", "pp", "dpLocal", "dpSize", "poolGpus", "currentNode", "startRank", "docker_command", "docker_argv", "node_commands"]);
+  const allowed = new Set(["command", "argv", "env", "nodes", "parallelism", "tp", "pcp", "pp", "dpLocal", "dpSize", "poolGpus", "currentNode", "startRank", "docker_command", "docker_argv", "node_commands"]);
   const staticAt = (rank) => renderCommand(recipe, "default", "pd_cluster", "ascend_950dt", 1, [], strategies, taxonomy,
     pools(rank), null, "ascend_pd", undefined, true);
   const first = staticAt(0);

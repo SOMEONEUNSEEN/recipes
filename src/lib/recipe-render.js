@@ -330,7 +330,7 @@ export function renderCommand(recipe, variantKey, strategy, hwId, nodeCount, fea
     const renderRole = (role) => {
       const current = result[role];
       // Layout/control state stays internal; this is the published contract.
-      const fields = ["nodes", "parallelism", "tp", "pp", "dpLocal", "dpSize", "poolGpus", "currentNode", "startRank"];
+      const fields = ["nodes", "parallelism", "tp", "pcp", "pp", "dpLocal", "dpSize", "poolGpus", "currentNode", "startRank"];
       const meta = Object.fromEntries(fields.filter((k) => current[k] !== undefined).map((k) => [k, current[k]]));
       const raw = pdNodes?.[role];
       const selection = typeof raw === "number" ? { nodes: raw } : (raw || {});

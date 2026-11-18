@@ -132,6 +132,7 @@ export function buildRecipeSchema({ taxonomy, strategies }) {
     parallelism: { anyOf: [pdMode, keyed(hwKey, pdMode)] },
     tp: intOrHwMap,
     pp: intOrHwMap,
+    pcp: intOrHwMap,
     vllm_args: strings,
     env: envMap,
     parallel_flag: { type: "string" },
@@ -262,7 +263,7 @@ export function buildRecipeSchema({ taxonomy, strategies }) {
         const jsonArgs = keyed({ pattern: "^--" }, { type: "object" }, "edits to JSON-valued flags: keys to set, null deletes");
         const delta = { args: strings, env: envMap, remove_args: { type: "array", items: { type: "string", pattern: "^--" } }, json_args: jsonArgs };
         const role = obj({ ...delta, nodes: { type: "integer", minimum: 1 }, parallelism: pdMode,
-          tp: { type: "integer", minimum: 1 }, pp: { type: "integer", minimum: 1 } });
+          tp: { type: "integer", minimum: 1 }, pp: { type: "integer", minimum: 1 }, pcp: { type: "integer", minimum: 1 } });
         const roles = obj({ prefill: role, decode: role });
         const select = obj({
           nodes: { type: "integer", minimum: 1 },
